@@ -108,8 +108,11 @@ class TransformerEncoderLayer(nn.Module):
     
     if self.doc_ctx_start and self.cross_attn:
       assert(inputs is not None and trans_inputs is not None)
-      trans_inputs = do_cross_attn(inputs, trans_inputs, mask, attn_type="share")
-      inputs = do_cross_attn(trans_inputs, inputs, trans_mask, attn_type="share")
+      
+      trans_attn_type, src_attn_type = "auto2src", "src2auto" if self.share_enc_cross_attn \
+                                                                  else "share", "share"
+      trans_inputs = do_cross_attn(inputs, trans_inputs, mask, attn_type=trans_attn_type)
+      inputs = do_cross_attn(trans_inputs, inputs, trans_mask, attn_type=trans_attn_type)
 
     
     if inputs is not None:

@@ -128,14 +128,16 @@ class TransformerDecoderLayer(nn.Module):
     # do cross attention when both gate mechanism and auto translation are available
     if memory_bank is not None and auto_trans_bank is None:
       mid, attn = do_cross_attn(memory_bank, query, src_pad_mask, attn_type=src_cross)
+    
     if memory_bank is None and auto_trans_bank is not None:
       mid, attn = do_cross_attn(auto_trans_bank, query, auto_trans_mask, attn_type=auto_cross,inner_type="auto_context")
     
     if self.gated_auto_src:
+      
       assert(self.only_fixed == 0 or auto_trans_bank is not None or self.use_auto_trans == 1)
       if self.doc_ctx_start:
         src_cross_o, attn = do_cross_attn(memory_bank, query, src_pad_mask, attn_type=src_cross, return_resnet=False)
-        auto_cross_o, attn = do_cross_attn(auto_trans_bank, query, auto_trans_mask, attn_type=auto_cross,inner_type="auto_context",return_resnet=False)
+        auto_cross_o, attn = do_cross_attn(auto_trans_bank, query, auto_trans_mask, attn_type=auto_cross,inner_type="auto_context", return_resnet=False)
         mid, z = self.gate_module(auto_cross_o, src_cross_o, return_gate_num=True)
         mid = self.drop(mid) + query
       if not self.doc_ctx_start:
