@@ -2,7 +2,6 @@
 import math
 import torch
 import torch.nn as nn
-
 # from onmt.utils.misc import aeq
 
 
@@ -11,19 +10,62 @@ class GateController(nn.Module):
   def __init__(self, model_dim):
     super(GateController, self).__init__()
     
-    self.input1_l = nn.Linear(in_features=model_dim*2, out_features=model_dim, bias=False)
-    # self.input2_l = nn.Linear(in_features=model_dim, out_features=model_dim, bias=False)
+    self.input1_l = nn.Linear(in_features=model_dim, out_features=model_dim, bias=False)
+    self.input2_l = nn.Linear(in_features=model_dim, out_features=model_dim, bias=False)
+    self.final_linear = nn.Linear(in_features=model_dim * 2, out_features=model_dim,  bias=False)
     
     self.gate = nn.Sigmoid()
   
 
   def forward(self, input1, input2, return_gate_num=False):
-    # z = self.gate(self.input1_l(input1) + self.input2_l(input2))
-    z = self.gate(self.input1_l(torch.cat((input1, input2), dim=-1)))
+    z = self.gate(self.final_linear(torch.cat((self.input1_l(input1), self.input2_l(input2)), dim=-1)))
     if return_gate_num:
       return z*input1 + (1 - z)*input2, z.mean()
     else:
       return z*input1 + (1 - z)*input2
+
+
+class Projector(nn.Module):
+  """ A two-layer Feed-Forward-Network.
+
+      Args:
+          d_model (int): the size of input for the first-layer of the FFN.
+          d_ff (int): the hidden layer size of the second-layer
+                            of the FNN.
+          dropout (float): dropout probability(0-1.0).
+  """
+
+  def __init__(self, d_model, dropout=0.1, hidden_layers_num=1):
+    super(Projector, self).__init__()
+    hidden_size = 2 * d_model
+    self.dropout = nn.Dropout(dropout)
+    self.input_layer = nn.Sequential(
+      nn.Linear(d_model, hidden_size),
+      nn.ReLU()
+    )
+    self.hidden_layers_num = hidden_layers_num
+    self.hidden_layers = nn.ModuleList([nn.Sequential(nn.Linear(hidden_size, hidden_size), nn.ReLU())\
+                          for _ in range(hidden_layers_num)])
+    
+    self.output_layer = nn.Linear(hidden_size, d_model)
+
+  def forward(self, x):
+    """
+    Layer definition.
+
+    Args:
+        input: [ batch_size, input_len, model_dim ]
+
+
+    Returns:
+        output: [ batch_size, input_len, model_dim ]
+    """
+    output = self.dropout(self.input_layer(x))
+    for i in range(self.hidden_layers_num):
+      ouput = self.dropout(self.hidden_layers[i](output))
+    output = self.output_layer(ouput)
+    
+    return output
 
 
 

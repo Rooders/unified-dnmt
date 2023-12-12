@@ -27,7 +27,7 @@ def save_fields_to_vocab(fields):
 def build_field_vocab(field, counter, **kwargs):
   specials = list(OrderedDict.fromkeys(
     tok for tok in [Constants.UNK_WORD, Constants.PAD_WORD, Constants.BOS_WORD, Constants.EOS_WORD, 
-                    Constants.SLU_WORD, Constants.SEG_WORD, Constants.MASK_WORD]
+                    Constants.SLU_WORD, Constants.TLU_WORD, Constants.SEG_WORD, Constants.MASK_WORD]
     if tok is not None))
   field.vocab = field.vocab_cls(counter, specials=specials, **kwargs)
 
@@ -35,7 +35,8 @@ def merge_vocabs(vocabs, vocab_size=None, min_frequency=1):
   merged = sum([vocab.freqs for vocab in vocabs], Counter())
   return torchtext.vocab.Vocab(merged,
                                specials=[Constants.UNK_WORD, Constants.PAD_WORD,
-                                         Constants.BOS_WORD, Constants.SLU_WORD, Constants.SEG_WORD, Constants.MASK_WORD],
+                                         Constants.BOS_WORD, Constants.SLU_WORD, Constants.TLU_WORD, 
+                                         Constants.SEG_WORD, Constants.MASK_WORD],
                                max_size=vocab_size,
                                min_freq=min_frequency)    
 

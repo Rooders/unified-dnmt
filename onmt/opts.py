@@ -52,6 +52,10 @@ def model_opts(parser):
               help='Number of layers in the encoder')
     group.add('--dec_layers', '-dec_layers', type=int, default=6,
               help='Number of layers in the decoder')
+
+    group.add('--doc_context_layers', '-doc_context_layers', type=int, default=2,
+              help='Number of layers in the decoder')
+    
     group.add('--enc_rnn_size', '-enc_rnn_size', type=int, default=512,
               help="""Size of encoder rnn hidden states.
                        Must be equal to dec_rnn_size except for
@@ -231,32 +235,11 @@ def train_opts(parser):
     group.add('--auto_mlm', '-auto_mlm', type=int, default=0,
             help="use the MASK LNAGUAGE MDOEL for auto translation encoding")
     
-    group.add('--mlm_affine', '-mlm_affine', type=int, default=0,
+    group.add('--use_affine', '-use_affine', type=int, default=0,
             help="use the MASK LNAGUAGE MDOEL for auto translation encoding")
 
     group.add('--mlm_prob', '-mlm_prob', type=float, default=0.15,
             help="probility of token that be masked in MASK LNAGUAGE MDOEL")
-    
-    group.add('--mlm_distill', '-mlm_distill', type=int, default=0,
-            help="probility of token that be masked in MASK LNAGUAGE MDOEL")
-    
-    group.add('--start_distill_step', '-start_distill_step', type=int, default=100000,
-            help="probility of token that be masked in MASK LNAGUAGE MDOEL")
-    
-    group.add('--distill_annealing', '-distill_annealing', type=int, default=1,
-            help="probility of token that be masked in MASK LNAGUAGE MDOEL")
-    
-    group.add('--distill_threshold', '-distill_threshold', type=float, default=0.2,
-            help="probility of token that be masked in MASK LNAGUAGE MDOEL")
-   
-    group.add('--distill_prob', '-distill_prob', type=float, default=0.15,
-            help="probility of token that be masked in MASK LNAGUAGE MDOEL")
-    
-    group.add('--share_mlm_decoder_embeddings', '-share_mlm_decoder_embeddings', type=int, default=0,
-            help="if use target embedding as the init weight of generator of mlm decoder")
-    
-    group.add('--new_gen', '-new_gen', type=int, default=0,
-            help="if mlm decoder not share the generator with decoder of nmt model")
     
     group.add('--mlm_weight', '-mlm_weight', type=float, default=1.0,
             help="approach to the truth translation")
@@ -266,11 +249,6 @@ def train_opts(parser):
     
     group.add('--auto_truth_trans_kl', '-auto_truth_trans_kl', type=int, default=0,
             help="approach to the truth translation")
-    
-
-
-
-
     group.add('--weight_trans_kl', '-weight_trans_kl', type=float, default=1.0,
             help="approach to the truth translation")
     group.add('--use_src_app', '-use_src_app', type=int, default=0,
@@ -281,14 +259,12 @@ def train_opts(parser):
             help="approach to the truth translation")
     group.add('--use_z_contronl', '-use_z_contronl', type=int, default=0,
             help="approach to the truth translation")
-
-
-
-
-
     group.add('--fixed_trans', '-fixed_trans', type=int, default=0,
             help="use the automatic translation to improve the performance of transltion")
-
+    
+    group.add('--distance_fc', '-distance_fc', default='euclidean', choices=['euclidean', 'cosine', 'dot_prod'],
+              help="""distance metric.""")
+    
     group.add('--cross_out_encoder', '-cross_out_encoder', type=int, default=0,
             help="use the automatic translation to improve the performance of transltion")
     
@@ -487,8 +463,6 @@ def translate_opts(parser):
                        sequence)""")
     group.add('--tgt', '-tgt',
                        help='True target sequence (optional)')
-    group.add('--force_decoding', '-force_decoding', action='store_true',
-              help="Share source and target vocabulary")
     
     group.add('--tgt_tran', '-tgt_tran',
                        help='Automatic target sequence (optional)')

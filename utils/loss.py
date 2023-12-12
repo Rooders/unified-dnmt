@@ -3,7 +3,6 @@ This includes: LossComputeBase and the standard NMTLossCompute, and
                sharded loss compute stuff.
 """
 from __future__ import division
-import sre_constants
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -29,33 +28,34 @@ def build_loss_compute(model, tgt_vocab, src_vocab, opt, train=True):
 
   padding_idx = tgt_vocab.stoi[Constants.PAD_WORD]
   src_padding_idx = src_vocab.stoi[Constants.PAD_WORD]
-  if opt.label_smoothing > 0 and train:
+  if opt.label_smoothing > 0:
     criterion = LabelSmoothingLoss(
       opt.label_smoothing, len(tgt_vocab), ignore_index=padding_idx
     )
-    # if opt.src_mlm:
-    #   src_criterion = LabelSmoothingLoss(
-    #   opt.label_smoothing, len(src_vocab), ignore_index=src_padding_idx
-    # )
-    # else:
-    #   src_criterion = None
-  
+    if not opt.share_embeddings:
+      src_criterion = LabelSmoothingLoss(
+        opt.label_smoothing, len(src_vocab), ignore_index=src_padding_idx
+      )
+    else:
+      src_criterion = criterion
+
   else:
     criterion = nn.NLLLoss(ignore_index=padding_idx, reduction='sum')
-    # if opt.src_mlm:
-    #   src_criterion = nn.NLLLoss(ignore_index=src_padding_idx, reduction='sum')
-    # else:
-    #   src_criterion = None
-  
+    if not opt.share_embeddings:
+      src_criterion = nn.NLLLoss(ignore_index=src_padding_idx, reduction='sum')
+    else:
+      src_criterion = criterion
+
 
   # if the loss function operates on vectors of raw logits instead of
   # probabilities, only the first part of the generator needs to be
   # passed to the NMTLossCompute. At the moment, the only supported
   # loss function of this kind is the sparsemax loss.
   loss_gen = model.generator
-  mlm_loss_gen = model.mlm_generator
-  compute = NMTLossCompute(criterion, loss_gen, mlm_loss_gen, mlm_weight=opt.mlm_weight, distill_prob=opt.distill_prob, distill_threshold=opt.distill_threshold)
+  src_gen = model.src_generator
+  compute = NMTLossCompute(criterion, loss_gen, src_criterion, src_gen, opt.weight_trans_kl, opt.use_z_contronl)
   compute.to(device)
+
   return compute
 
 
@@ -78,14 +78,21 @@ class LossComputeBase(nn.Module):
         normalzation (str): normalize by "sents" or "tokens"
     """
 
-    def __init__(self, criterion, generator):
+    def __init__(self, criterion, generator, src_criterion, src_generator, enc_loss_w=1.0, use_z_contronl=False):
         super(LossComputeBase, self).__init__()
         self.criterion = criterion
         self.generator = generator
+        self.src_criterion = src_criterion
+        self.src_generator = src_generator
+        self.weight_trans_kl = enc_loss_w
+        self.use_z_contronl = use_z_contronl
 
     @property
     def padding_idx(self):
         return self.criterion.ignore_index
+    
+    def src_padding_idx(self):
+        return self.src_criterion.ignore_index
 
     def _make_shard_state(self, batch, output, range_, attns=None):
         """
@@ -114,7 +121,7 @@ class LossComputeBase(nn.Module):
         """
         return NotImplementedError
 
-    def monolithic_compute_loss(self, batch, output, attns, mlm_out=None, mlm_labels=None):
+    def monolithic_compute_loss(self, batch, output, attns, src_cls_hid=None, auto_cls_hid=None, enc_loss=0, accum_norm=1.0):
         """
         Compute the forward loss for the batch.
 
@@ -132,18 +139,27 @@ class LossComputeBase(nn.Module):
         shard_state = self._make_shard_state(batch, output, range_, attns)
         _, batch_stats = self._compute_loss(batch, **shard_state)
         
-        # compute MLM loss for source side
-        if mlm_labels is not None:
-          _, mlm_stats = self._compute_loss(batch, mlm_out, mlm_labels, gen_type="mlm_gen")
+        
+
+        if src_cls_hid is not None:
+          src_cls_loss = self._compute_cls_loss(batch, src_cls_hid, batch.tgt[1:], gen_type="tgt")
         else:
-          mlm_stats = None 
+          src_cls_loss = 0.0
+        
+        if auto_cls_hid is not None:
+          auto_cls_loss = self._compute_cls_loss(batch, auto_cls_hid, batch.tgt[1:], gen_type="tgt")
+        else:
+          auto_cls_loss = 0.0
+        
+        enc_loss = src_cls_loss + auto_cls_loss
+        if enc_loss > 0:
+          batch_stats.add_enc_loss(enc_loss.clone().item())
 
-
-        return batch_stats, mlm_stats
+        return batch_stats, None
 
     def sharded_compute_loss(self, batch, output, attns,
                              cur_trunc, trunc_size, shard_size,
-                             normalization, scaler=None,  mlm_out=None, mlm_labels=None, accum_norm=1.0):
+                             normalization, scaler=None, src_cls_hid=None, auto_cls_hid=None, enc_loss=1.0, accum_norm=1.0):
         """Compute the forward loss and backpropagate.  Computation is done
         with shards and optionally truncation for memory efficiency.
 
@@ -172,40 +188,50 @@ class LossComputeBase(nn.Module):
 
         """
         batch_stats = Statistics()
-        mlm_batch_stats = Statistics() if mlm_labels is not None else None
-        # all_loss = 0.0
         # range_ = (cur_trunc, cur_trunc + trunc_size)
+
         # shard_state = self._make_shard_state(batch, output, range_, attns)
-        # for shard in shards(shard_state, shard_size, creat_graph=True):
+        # for shard in shards(shard_state, shard_size):
         #     loss, stats = self._compute_loss(batch, **shard)
-        #     all_loss = loss.div(float(normalization)) + all_loss
+        #     loss.div(float(normalization)).backward()
         #     batch_stats.update(stats)
         non_pad_mask = batch.tgt[1:] != self.criterion.ignore_index # [seq_len, batch]
-        non_pad_idx = non_pad_mask.float().view(-1).nonzero().squeeze(1)
+        non_pad_idx = non_pad_mask.float().contiguous().view(-1).nonzero().squeeze(1) # [bs, 1]
+        sent_non_pad_idx = non_pad_mask.transpose(0, 1).float().sum(1).contiguous().nonzero().squeeze(1) #[sent_num]
         loss, stats = self._compute_loss(batch, output, batch.tgt[1:], select_mask=non_pad_idx)
-        loss = loss.div(float(normalization)) / accum_norm
-        # compute MLM loss
-        if mlm_labels is not None:
-          non_pad_mask = mlm_labels != self.criterion.ignore_index # [seq_len, batch]
-          non_pad_idx = non_pad_mask.float().view(-1).nonzero().squeeze(1)
-          mlm_normalization = (mlm_labels != self.criterion.ignore_index).float().sum()
-          mlm_loss, mlm_stats = self._compute_loss(batch, mlm_out, mlm_labels, gen_type="mlm_gen", select_mask=non_pad_idx)
-          mlm_loss = mlm_loss.div(float(mlm_normalization) * accum_norm)
-          mlm_batch_stats.update(mlm_stats)
-        else:
-          mlm_loss = 0.0
-          mlm_batch_stats = None
+        # loss, stats = self._compute_loss(batch, output, batch.tgt[1:])
+        loss = loss.div(float(normalization))
         
-        loss = self.mlm_weight * mlm_loss + (1 - self.mlm_weight) * loss
+
+        # src cls loss
+        if src_cls_hid is not None:
+          src_cls_loss = self._compute_cls_loss(batch, src_cls_hid, batch.tgt[1:], gen_type='tgt', select_mask=sent_non_pad_idx)
+          src_cls_loss = src_cls_loss.div(float(normalization))
+        else:
+          src_cls_loss = 0.0
+        # auto cls loss
+        if auto_cls_hid is not None:
+          auto_cls_loss = self._compute_cls_loss(batch, auto_cls_hid, batch.tgt[1:], gen_type='tgt', select_mask=sent_non_pad_idx)
+          auto_cls_loss = auto_cls_loss.div(float(normalization))
+        else:
+          auto_cls_loss = 0.0 
+        
+        if self.use_z_contronl:
+          cls_loss = (src_cls_loss + auto_cls_loss) * self.weight_trans_kl * enc_loss
+        else:
+          cls_loss = (src_cls_loss + auto_cls_loss) * self.weight_trans_kl
+
+        if cls_loss > 0:
+          stats.add_enc_loss(cls_loss.clone().item())
+          loss = cls_loss + loss
         # use auto-mixed precision
         if scaler is not None:
           scaler.scale(loss).backward()
         else:
           loss.backward()
-        
         batch_stats.update(stats)
-        return batch_stats, mlm_batch_stats
-    
+        return batch_stats, None
+
     def _stats(self, loss, scores, target):
         """
         Args:
@@ -247,14 +273,22 @@ class LabelSmoothingLoss(nn.Module):
 
     self.confidence = 1.0 - label_smoothing
 
-  def forward(self, output, target):
+  def forward(self, output, target, cls_target=False):
     """
     output (FloatTensor): batch_size x n_classes
-    target (LongTensor): batch_size
+    target (LongTensor): batch_size or (sent_num, seq_len)
     """
-    model_prob = self.one_hot.repeat(target.size(0), 1)
-    model_prob.scatter_(1, target.unsqueeze(1), self.confidence)
-    model_prob.masked_fill_((target == self.ignore_index).unsqueeze(1), 0)
+    if cls_target:
+      model_prob = self.one_hot.repeat(target.size(1), 1) # [sent_num, n_cla]
+      model_prob.scatter_(1, target.transpose(0, 1), self.confidence) # [sent_num, n_cla]
+      model_prob[:, self.ignore_index] = 0
+      mask = ((target.transpose(0, 1) != self.ignore_index).sum(1, keepdim=True)) == 0 # [sent_num, 1]
+      model_prob.masked_fill_(mask, 0)
+    else:  
+      model_prob = self.one_hot.repeat(target.size(0), 1) # [bs, n_cla]
+      model_prob.scatter_(1, target.unsqueeze(1), self.confidence)
+      model_prob.masked_fill_((target == self.ignore_index).unsqueeze(1), 0)
+    
 
     return F.kl_div(output, model_prob, reduction='sum')
 
@@ -264,109 +298,41 @@ class NMTLossCompute(LossComputeBase):
   Standard NMT Loss Computation.
   """
 
-  def __init__(self, criterion, generator, mlm_generator, mlm_weight=1.0, distill_prob=0.15, distill_threshold=0.2, normalization="sents"):
-    super(NMTLossCompute, self).__init__(criterion, generator)
-    
-    self.mlm_generator = mlm_generator
-    self.mlm_weight = mlm_weight
-    self.distill_prob = distill_prob
-    self.distill_threshold = distill_threshold
+  def __init__(self, criterion, generator, src_criterion, src_generator, enc_loss_w, use_z_contronl, normalization="sents"):
+    super(NMTLossCompute, self).__init__(criterion, generator, src_criterion, src_generator, enc_loss_w, use_z_contronl)
+
   def _make_shard_state(self, batch, output, range_, attns=None):
     return {
         "output": output,
         "target": batch.tgt[range_[0] + 1: range_[1]],
     }
-  
-  def _make_sample_state(self, target, output, range_):
-    return {
-        "output": output,
-        "target": target[range_[0] + 1: range_[1]],
-    }
-  
-  def compute_distillation_loss(self, tgt, nmt_prob, mlm_prob, select_prob_mask, normalization, scaler=None, annealing_coef=1.0):
-    # select_prob_mask: [seq_len, batch_size] 1: use distillation 0: not use
-    # nmt_prob, mlm_prob: [seq_len * batch_size, vocab_size]
-    batch_stats = Statistics()
-    truth = tgt[1:].contiguous().view(-1) # [seq_len-1 * batch_size]
-    label_s_prob = self.criterion.one_hot.repeat(truth.size(0), 1) # [seq_len-1 * batch_size, vocab_size]
-    label_s_prob.scatter_(1, truth.unsqueeze(1), self.criterion.confidence)
-    label_s_prob.masked_fill_((truth == self.criterion.ignore_index).unsqueeze(1), 0) # [token_num, vocab_size]
-    mlm_prob = torch.exp(mlm_prob)
-    # final_truth_prob = label_s_prob
-    # truth label loss of selected words
-    select_prob_mask = select_prob_mask.contiguous().view(-1)
-    select_idx = select_prob_mask.nonzero().squeeze(1) # [non_zero_num]
-    
-    # non_select_idx = (1 - select_prob_mask).nonzero().squeeze(1) # [zero_num]
-    non_pad_mask = truth != self.criterion.ignore_index # [seq_len, batch]
-    non_select_mask = (1-select_prob_mask).bool() & non_pad_mask
-    non_select_idx = non_select_mask.float().nonzero().squeeze(1)
-    distill_label_loss = F.kl_div(nmt_prob[select_idx], mlm_prob[select_idx], reduction='sum')
-    masked_truth_label_loss = F.kl_div(nmt_prob[select_idx], label_s_prob[select_idx], reduction='sum')
-    unmasked_truth_label_loss = F.kl_div(nmt_prob[non_select_idx], label_s_prob[non_select_idx], reduction='sum') # [token_num, vocab_size]
-    
-    # masked_truth_label_loss = truth_label_loss * select_prob_mask # [token_num, vocab_size]
-    # unmask_truth_label_loss = truth_label_loss * (1 - select_prob_mask) # [token_num, vocab_size]
-    
-    
-    # distill_label_loss = F.kl_div(nmt_prob, mlm_prob, reduction='none') * select_prob_mask # [token_num, vocab_size] 
-    loss = unmasked_truth_label_loss + annealing_coef * masked_truth_label_loss + (1-annealing_coef) * distill_label_loss
-    
-    # final_truth_prob = mlm_prob * (select_prob_mask.contiguous().view(-1).unsqueeze(1)) \
-    #        + label_s_prob * ((1 - select_prob_mask).contiguous().view(-1).unsqueeze(1))
-    # loss = F.kl_div(nmt_prob, final_truth_prob, reduction='sum')
-    stats = self._stats(loss.clone(), nmt_prob, truth)
-    batch_stats.update(stats)
-    loss = loss.div(float(normalization))
-    if scaler is not None:
-      scaler.scale(loss).backward()
-    else:
-      loss.backward()
-    
-    return batch_stats
 
-  def only_compute_prob(self, output, target=None, select_prob=False, gen_type='tgt_gen', gen=None):
-    # output: seq_len, batch_size, hidden
-    # target: seq_len, batche_size
-    bottled_output = self._bottle(output) # [token_num, hidden]
-    if gen is None:
-      gen_t = self.generator if gen_type == 'tgt_gen' else self.mlm_generator
-    else:
-      gen_t = gen
-    
-    scores = gen_t(bottled_output) # [token_num, vocab_size]
-    
-    if select_prob:
-      # select the prob in truth
-      truth_idx = target[1:].contiguous().view(-1).unsqueeze(1) # [seq_len-1 * batch_size, 1]
-      padding_mask = truth_idx == self.criterion.ignore_index # [seq_len-1 * batch_size, 1]
-      truth_prob = scores.gather(index=truth_idx, dim=-1) # [token_num, 1]
-      truth_prob.masked_fill_(padding_mask, 0.0) # [seq_len-1 * batch_size, 1]
-      distill_prob_mask = torch.exp(truth_prob) < self.distill_threshold
-      distill_prob_mask = distill_prob_mask.squeeze(1).view(target[1:].size(0), -1).contiguous() #[seq_len, batch_size]
-      # prob = distill_prob_mask.float().sum() / (1 - padding_mask.float()).sum() 
-      # print(prob)
-      return scores, distill_prob_mask.float()
-    
-    return scores, None
-
-
-  
-  
-  def _compute_loss(self, batch, output, target, gen_type="tgt_gen", select_mask=None):
-    bottled_output = self._bottle(output) # [token_num, hidden]
+  def _compute_loss(self, batch, output, target, select_mask=None):
+    bottled_output = self._bottle(output)
     gtruth = target.contiguous().view(-1)
     if select_mask is not None: # [non-pading token_num]
       bottled_output = bottled_output[select_mask]
       gtruth = gtruth[select_mask]
       assert(gtruth.size(0) == bottled_output.size(0))
-    gen_t = self.generator if gen_type == 'tgt_gen' else self.mlm_generator    
-    scores = gen_t(bottled_output)
+    scores = self.generator(bottled_output)
     loss = self.criterion(scores, gtruth)
     stats = self._stats(loss.clone(), scores, gtruth)
-
     return loss, stats
 
+  def _compute_cls_loss(self, batch, cls_hid, label, gen_type="tgt", select_mask=None):
+    
+    (cls_hid, label) = (cls_hid[select_mask], label[:, select_mask]) if select_mask is not None else (cls_hid, label)
+    
+    if gen_type == 'tgt':
+      scores = self.generator(cls_hid)
+      loss = self.criterion(scores, label, cls_target=True)
+    if gen_type == 'src':
+      scores = self.src_generator(cls_hid)
+      loss = self.src_criterion(scores, label, cls_target=True)
+    
+    return loss
+    
+    
 
 def filter_shard_state(state, shard_size=None):
     for k, v in state.items():
@@ -383,7 +349,7 @@ def filter_shard_state(state, shard_size=None):
             yield k, (v, v_split)
 
 
-def shards(state, shard_size, eval_only=False, creat_graph=False):
+def shards(state, shard_size, eval_only=False):
     """
     Args:
         state: A dictionary which corresponds to the output of
@@ -430,4 +396,4 @@ def shards(state, shard_size, eval_only=False, creat_graph=False):
                 variables.extend(zip(torch.split(state[k], shard_size),
                                      [v_chunk.grad for v_chunk in v_split]))
         inputs, grads = zip(*variables)
-        torch.autograd.backward(inputs, grads, creat_graph=creat_graph)
+        torch.autograd.backward(inputs, grads)

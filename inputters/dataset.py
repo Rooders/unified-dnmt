@@ -92,13 +92,13 @@ def get_auto_trans_fields(fields=None, sentence_level=False, use_auto_trans=Fals
 
   if sentence_level:
     fields["tgt_tran"] = torchtext.data.Field(
-      init_token=Constants.SLU_WORD,
+      init_token=Constants.TLU_WORD,
       pad_token=Constants.PAD_WORD,
       eos_token=Constants.EOS_WORD,
       include_lengths=False)
   else:
     nested_field = torchtext.data.Field(
-      init_token=Constants.SLU_WORD,
+      init_token=Constants.TLU_WORD,
       eos_token=Constants.EOS_WORD,
       pad_token=Constants.PAD_WORD
     )
@@ -381,7 +381,6 @@ def build_dataset_iter(datasets, fields, opt, is_train=True):
         such that the total number of src/tgt tokens (including padding)
         in a batch <= batch_size
         """
-        # Maintains the longest src and tgt length in the current batch
         global max_src_in_batch, max_tgt_in_batch, max_sent_num_in_batch, max_src_seq_len, max_tgt_seq_len
         # Reset current longest length at a new batch (count=1)
         if count == 1:
@@ -408,6 +407,28 @@ def build_dataset_iter(datasets, fields, opt, is_train=True):
         src_elements = count * max_src_in_batch
         tgt_elements = count * max_tgt_in_batch
         return max(src_elements, tgt_elements)
+        
+        
+        
+        # # Maintains the longest src and tgt length in the current batch
+        # global max_src_in_batch, max_tgt_in_batch
+        # # Reset current longest length at a new batch (count=1)
+        # if count == 1:
+        #     max_src_in_batch = 0
+        #     max_tgt_in_batch = 0
+        # # Src: w1 ... wN <eos>
+        # num_src_token = 0
+        # for sent in new.src:
+        #   num_src_token += len(sent) + 1
+        # num_tgt_token = 0
+        # for sent in new.tgt:
+        #   num_tgt_token += len(sent) + 2
+        # max_src_in_batch = max(max_src_in_batch, num_src_token)
+        # # Tgt:<bos> w1 ... wN <eos>
+        # max_tgt_in_batch = max(max_tgt_in_batch, num_tgt_token)
+        # src_elements = count * max_src_in_batch
+        # tgt_elements = count * max_tgt_in_batch
+        # return max(src_elements, tgt_elements)
   else:
     batch_size_fn = None
 
@@ -509,19 +530,19 @@ class Dataset(torchtext.data.Dataset):
         sentences = doc_line.split(' ||| ')  #[sents_num]
         # add the placeholder for the blank sentence.
         sentences = [Constants.PAD_WORD if sent.strip() == "" else sent.strip() for sent in sentences]
-        # #if side == 'tgt' and paired_trans:
-        # if paired_trans:
-        #   sentence_pairs = []
-        #   first_pair = sentences[-1] + " " + seg_tok + " " + sentences[0]
-        #   sentence_pairs.append(first_pair)
-        #   for sent1, sent2 in zip(sentences[:-1], sentences[1:]):
-        #     paired_sent = sent1 + " " + seg_tok + " " + sent2 
-        #     sentence_pairs.append(paired_sent)
-        #   assert len(sentence_pairs) == len(sentences)
-        #   words = [p.strip().split() for p in sentence_pairs]
+        #if side == 'tgt' and paired_trans:
+        if paired_trans:
+          sentence_pairs = []
+          first_pair = sentences[-1] + " " + seg_tok + " " + sentences[0]
+          sentence_pairs.append(first_pair)
+          for sent1, sent2 in zip(sentences[:-1], sentences[1:]):
+            paired_sent = sent1 + " " + seg_tok + " " + sent2 
+            sentence_pairs.append(paired_sent)
+          assert len(sentence_pairs) == len(sentences)
+          words = [p.strip().split() for p in sentence_pairs]
           
-        # else:    
-        words = [p.strip().split() for p in sentences]  #[sent_num, seq_len]
+        else:    
+          words = [p.strip().split() for p in sentences]  #[sent_num, seq_len]
         # print(sentences)
         
         assert(" " not in sentences or "" not in sentences)

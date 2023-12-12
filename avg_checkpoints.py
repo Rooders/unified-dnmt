@@ -15,7 +15,7 @@ def sort_checkpoints(path_list):
   saved_models = []
   for path in path_list:
     # path: model_step_100000.pt
-    p = re.compile(r'_step_(.*)\.pt$')
+    p = re.compile(r'model_step_(.*)\.pt$')
     matches = p.findall(path)
     if len(matches) > 0:
       i = int(matches[0])
@@ -29,13 +29,12 @@ if __name__=="__main__":
   script, model_save_dir, ensemble_path , number = argv
   if model_save_dir is None:
     print("model_save_dir error")
-  print(model_save_dir)
 
   checkpoints_list = get_checkpoints(model_save_dir)
   checkpoints_list = sort_checkpoints(checkpoints_list)
   checkpoints_list = checkpoints_list[-int(number):]
   print("Averaging checkpoints: \n{}".format(checkpoints_list))
-  
+ 
   print("start average the last {} model".format(number)) 
   model_list = []
   generator_list = []
@@ -62,9 +61,9 @@ if __name__=="__main__":
   model_dict_avg = {}
   generator_dict_avg = {}
   for key, value in model_dict.items():
-    model_dict_avg[key] = value / float(number)
+    model_dict_avg[key] = value / int(number)
   for key, value in generator_dict.items():
-    generator_dict_avg[key] = value / float(number)
+    generator_dict_avg[key] = value / int(number)
   
   checkpoint_ensemble = {'vocab':vocab, 'opt': opt, 'model': model_dict_avg, 'generator':generator_dict_avg, 'optim':optim}
   torch.save(checkpoint_ensemble, ensemble_path)

@@ -37,7 +37,6 @@ class Translator(object):
     self.pre_paired_trans = opt.pre_paired_trans
     self.minimal_relative_prob = opt.minimal_relative_prob
     self.out_file = out_file
-    self.force_decoding = opt.force_decoding
     self.tgt_eos_id = fields["tgt"].vocab.stoi[Constants.EOS_WORD]
     self.tgt_bos_id = fields["tgt"].vocab.stoi[Constants.BOS_WORD]
     self.src_eos_id = fields["src"].vocab.stoi[Constants.EOS_WORD]
@@ -51,8 +50,13 @@ class Translator(object):
     self.cross_before = model_opt.cross_before
     self.decoder_cross_before = model_opt.decoder_cross_before
     self.only_fixed = model_opt.only_fixed
+    self.src_mlm = model_opt.src_mlm
+    self.auto_truth_trans_kl = model_opt.auto_truth_trans_kl
+    print(self.auto_truth_trans_kl)
+    print(self.src_mlm)
     # self.shift_num = model_opt.shift_num
     # print(self.shift_num)
+  
   def build_tokens(self, idx, side="tgt"):
     assert side in ["src", "tgt", "tgt_tran"], "side should be either src or tgt"
     vocab = self.fields[side].vocab
@@ -96,20 +100,8 @@ class Translator(object):
     print("Begin decoding ...")
     batch_count = 0
     all_translation = []
-    all_scores = []
     if self.sentence_level:
       for batch in data_iter:
-        if self.force_decoding:
-          scores = self.force_decoding_translate(batch) # [sent_num]
-          scores = [str(s) for s in scores.tolist()]
-          for index, score in zip(batch.indices.data, scores):
-            while (len(all_scores) <=  index):
-              all_scores.append("")
-            all_scores[index] = score
-          batch_count += 1
-          print("batch: " + str(batch_count) + "...")
-          continue
-        
         hyps, scores = self.translate_batch(batch)
         assert len(batch) == len(hyps)
         batch_transtaltion = []
@@ -131,55 +123,17 @@ class Translator(object):
         # if document-level, need to proprecess batch
         num_doc, num_sents = batch.src[0].size(0), batch.src[0].size(1)
         batch.src = list(batch.src)
-        batch.src[0] = batch.src[0].view(num_doc * num_sents, -1).transpose(0, 1).contiguous()  # (seq_len, sents_num)
+        batch.src[0] = batch.src[0].view(num_doc * num_sents, -1).transpose(0, 1)  # (seq_len, sents_num)
         # batch.tgt = batch.tgt.view(num_doc * num_sents, -1).transpose(0, 1)  # (seq_len, sents_num)
         batch.src = tuple(batch.src)
-        batch_score = []
         if self.use_auto_trans:
-          batch.tgt_tran = batch.tgt_tran.view(num_doc * num_sents, -1).transpose(0, 1).contiguous() #(seq_len, sents_num)
+          batch.tgt_tran = batch.tgt_tran.view(num_doc * num_sents, -1).transpose(0, 1) #(seq_len, sents_num)
         
-        if self.force_decoding:
-          batch.tgt = batch.tgt.view(num_doc * num_sents, -1).transpose(0, 1).contiguous()
-          scores = self.force_decoding_translate(batch) # [sent_num]
-          
-          scores = [str(s) for s in scores.tolist()]
-          # import pdb
-          # pdb.set_trace()
-          batch_score.append("\n".join(scores) + "\n")
-          
-          # print(batch_score)
-          for index, score in zip(batch.indices.data, batch_score):
-            while (len(all_scores) <=  index):
-              all_scores.append("")
-            all_scores[index] = score
-          batch_count += 1
-          print("batch: " + str(batch_count) + "...")
-          continue
-          # if self.force_decoding:
-          # scores = self.force_decoding_translate(batch) # [sent_num]
-          # scores = [str(s) for s in scores.tolist()]
-          # for index, score in zip(batch.indices.data, scores):
-          #   while (len(all_scores) <=  index):
-          #     all_scores.append("")
-          #   all_scores[index] = score
-          # batch_count += 1
-          # print("batch: " + str(batch_count) + "...")
-          # continue
-
-        
-        
-          
         hyps, scores = self.translate_batch(batch)
-      
         #assert len(batch) == len(hyps)
         batch_transtaltion = []
         src_doc = []
         tran_doc = []
-        
-          
-        batch_score = []
-        
-        
         if self.use_auto_trans:
           auto_tran_doc = []
           for src_idx_seq, auto_trans_seq, tran_idx_seq, score in zip(batch.src[0].transpose(0, 1), batch.tgt_tran.transpose(0, 1), hyps, scores):
@@ -226,52 +180,14 @@ class Translator(object):
         batch_count += 1
         print("batch: " + str(batch_count) + "...")
     
-    
-
-
-    if out_file is not None and not self.force_decoding:
+    if out_file is not None:
       for tran in all_translation:
         if self.sentence_level:
           out_file.write(tran + '\n')
         else:
           out_file.write(tran)
-    
-    if out_file is not None and self.force_decoding:
-      for score in all_scores:
-        if self.sentence_level:
-          out_file.write(score + '\n')
-        else:
-          print(score)
-          out_file.write(score)
     print('Decoding took %.1f minutes ...'%(float(time.time() - start_time) / 60.))
   
-  def force_decoding_translate(self, batch):
-      src = make_features(batch, 'src')
-      tgt = make_features(batch, 'tgt')
-      src_lengths = batch.src[-1]
-      if self.use_auto_trans:
-        tgt_tran = make_features(batch, 'tgt_tran')
-      else:
-        tgt_tran = None
-      # F-prop through the model.
-      with torch.no_grad():
-        outputs, attns, mlm_outputs, mlm_labels = self.model(src, tgt, tgt_tran, src_lengths)
-        bottled_output = outputs.view(-1, outputs.size(2)) # [token_num, hidden]
-        scores = self.model.generator(bottled_output) # [token_num, vocab_size]
-        truth_idx = tgt[1:].view(-1).unsqueeze(1)
-        truth_scores = scores.gather(index=truth_idx, dim=-1) # [token_num, 1]
-        truth_scores = truth_scores.view(tgt[1:].size(0), tgt[1:].size(1)).transpose(0, 1) # [bs, seq_len]
-        word_padding_idx = self.model.decoder.embeddings.word_padding_idx
-        mask_scores = tgt[1:] != word_padding_idx
-        mask_scores = mask_scores.float().transpose(0, 1)
-        all_truth_scores = ((-truth_scores) * mask_scores).sum(dim=1) # [batch_size]
-        #avg_truth_scores =  all_truth_scores / mask_scores.sum(dim=1)
-        # all_truth_scores = (-truth_scores).sum(dim=1)
-        return all_truth_scores
-
-
-
-
   def translate_batch(self, batch):
     def get_inst_idx_to_tensor_position_map(inst_idx_list):
       ''' Indicate the position of an instance in a tensor. '''
@@ -368,7 +284,7 @@ class Translator(object):
         scores.append(score)
         
       return hyps, scores
-
+    
     with torch.no_grad():
       #-- Encode
       src_seq = make_features(batch, 'src')
@@ -381,21 +297,47 @@ class Translator(object):
         tgt_seg_emb = None
       # src_emb, src_enc, src_mask = self.model.encoder(src_seq, batch.src[-1])
       
-
+      auto_cls_hidden = None
+      src_cls_hidden = None
+      auto_avg_hidden = None
+      src_avg_hidden = None
+      tgt_tran_mask = None
+      enc_mask = None
+      memory_bank = None
+      auto_trans_out = None
       if self.use_auto_trans:
         tgt_tran = make_features(batch, 'tgt_tran')
-        tgt_tran_mask, tgt_tran_emb = self.model.get_embeding_and_mask_before_encoding(self.model.decoder.embeddings, tgt_tran, src_lengths)
+        # tgt_tran_mask, tgt_tran_emb = self.model.get_embeding_and_mask_before_encoding(self.model.decoder.embeddings, tgt_tran, src_lengths)
+        
+        if not self.only_fixed:
+          _, memory_bank, enc_mask, auto_trans_out, tgt_tran_mask = self.model.encoder_forward(task_type="unified_enc", \
+                                      lengths=src_lengths, src=src_seq, tgt_tran=tgt_tran)
+          if self.auto_truth_trans_kl:
+            auto_avg_hidden, _ = self.model.avg_pooling_with_mask(auto_trans_out.transpose(0, 1), tgt_tran_mask)
+            auto_cls_hidden = self.model.transfer_layer(auto_avg_hidden) # [doc_, dim]
+            
+            if self.src_mlm:
+              src_avg_hidden, _ = self.model.avg_pooling_with_mask(memory_bank.transpose(0, 1), enc_mask)
+              src_cls_hidden = self.model.transfer_layer(src_avg_hidden)
+          
+          
+          # if self.auto_truth_trans_kl:
+          #   auto_cls_hidden = auto_trans_out[0, :, :] # [doc_, dim]
+            
+          #   if self.src_mlm:
+          #     src_cls_hidden = memory_bank[0, :, :]
+          #       # _, memory_bank, enc_mask, auto_trans_out, _ = self.model.encoder(src_seq, src_length=src_lengths, \
+          #       #                                                               trans_emb=tgt_tran_emb, trans_mask=tgt_tran_mask)
         if self.only_fixed:
-          encode_tran_only = True
-        else:
-          encode_tran_only = False
-        
-        _, memory_bank, enc_mask, auto_trans_out = self.model.encoder(src_seq, src_length=src_lengths, auto_trans_emb=tgt_tran_emb, auto_trans_mask=tgt_tran_mask, only_trans_encoding=encode_tran_only)
-        
+          _, _, _, auto_trans_out, tgt_tran_mask = self.model.encoder_forward(task_type="tgt_enc", \
+                           lengths=src_lengths, tgt_tran=tgt_tran)
+          # _, memory_bank, enc_mask, auto_trans_out, _ = self.model.encoder(src_length=src_lengths, \
+          #                                                                trans_emb=tgt_tran_emb, trans_mask=tgt_tran_mask)
+      
       if not self.use_auto_trans:
-        _, memory_bank, enc_mask, _ = self.model.encoder(src_seq, src_length=src_lengths)
-        tgt_tran_mask, auto_trans_out = None, None
-
+        # _, memory_bank, enc_mask, auto_trans_out, tgt_tran_mask = self.model.encoder(src_seq, src_length=src_lengths)
+        _, memory_bank, enc_mask, _, _ = self.model.encoder_forward(task_type="src_enc", \
+                           lengths=src_lengths, src=src_seq)
 
       # if self.use_auto_trans:
       #   tgt_tran = make_features(batch, 'tgt_tran')
@@ -408,10 +350,9 @@ class Translator(object):
 
       # src_emb: (seq_len_src, batch_size, emb_size)
       # src_enc: (seq_len_src, batch_size, hid_size)
-      if self.only_fixed:
-        self.model.decoder.init_state(tgt_tran, auto_trans_out, tgt_tran_mask, segment_embeding=tgt_seg_emb)
-      else:
-        self.model.decoder.init_state(src_seq, memory_bank, enc_mask, segment_embeding=tgt_seg_emb, auto_trans_bank=auto_trans_out, auto_trans_mask=tgt_tran_mask)
+      self.model.decoder.init_state(src_seq, memory_bank, enc_mask, segment_embeding=tgt_seg_emb, \
+                                    auto_trans_bank=auto_trans_out, auto_trans_mask=tgt_tran_mask, 
+                                    src_cls_hidden=src_avg_hidden, auto_cls_hidden=auto_avg_hidden)
       # self.model.decoder.init_state(src_seq, memory_bank, enc_mask, segment_embeding=tgt_seg_emb)
       src_len = src_seq.size(0)
       

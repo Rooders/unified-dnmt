@@ -11,7 +11,7 @@ import onmt.constants as Constants
 
 from onmt.transformer_encoder import TransformerEncoder
 from onmt.transformer_decoder import TransformerDecoder
-
+from onmt.sublayer import Projector
 from onmt.embeddings import Embeddings
 from utils.misc import use_gpu
 from utils.logging import logger
@@ -22,20 +22,31 @@ import torch.nn.functional as F
 
 
 class NMTModel(nn.Module):
-  def __init__(self, encoder, decoder, model_opt, mlm_decoder=None):
+  def __init__(self, encoder, decoder, model_opt):
     super(NMTModel, self).__init__()
-    # modules
     self.encoder = encoder
     self.decoder = decoder
-    self.mlm_decoder = mlm_decoder
-    # options
+    # self.paired_trans = model_opt.paired_trans
     self.use_auto_trans = model_opt.use_auto_trans
     self.only_fixed = model_opt.only_fixed
-    self.mlm_prob = model_opt.mlm_prob
-    self.sentence_level = model_opt.sentence_level
-    self.mlm_distill = model_opt.mlm_distill
-
-
+    self.multi_task_training = model_opt.multi_task_training
+    #Options of making auto translation appraoch truth.
+    self.auto_truth_trans_kl = model_opt.auto_truth_trans_kl
+    self.cross_attn = model_opt.cross_attn
+    self.src_mlm = model_opt.src_mlm
+    self.weight_trans_kl = model_opt.weight_trans_kl
+    self.use_z_contronl = model_opt.use_z_contronl
+    self.distance_fc = model_opt.distance_fc
+    self.only_trans = False if self.only_fixed or self.cross_attn else True
+    # self.shift_num = model_opt.shift_num
+    # self.fixed_trans = model_opt.fixed_trans
+    if model_opt.use_affine:
+      self.transfer_layer = Projector(model_opt.enc_rnn_size, model_opt.dropout)
+    else:
+      def return_s(input):
+        return input
+      self.transfer_layer = return_s
+    
   def get_embeding_and_mask_before_encoding(self, embeddings_layer, seq, src_length):
     
     padding_idx = embeddings_layer.word_padding_idx
@@ -45,138 +56,126 @@ class NMTModel(nn.Module):
     mask = words.data.eq(padding_idx).unsqueeze(1)  # [B, 1, T]
 
     return mask, emb
+
+  def avg_pooling_with_mask(self, ori_input, mask):
+    # ori_input: [doc_num * sent_num, seq_len, hidden_size]
+    # mask: [doc_num * sent_num, 1, seq_len]
+    division = (1.0 - mask.float()).sum(dim=-1) # [doc_num * sent_num, 1]
+    sum_input = (ori_input * (mask.squeeze(1).unsqueeze(-1).float())).sum(dim=1) # [doc_num * sent_num, hidden_size]
+    loss_mask = division == 0
+    avg_output = sum_input / division.masked_fill_(loss_mask, torch.finfo(torch.float).max) #[doc_num * sent_num, hidden_size]
+    return avg_output, loss_mask
+
+
+  def encoder_forward(self, task_type="trans", **args):
+    if task_type == "unified_enc":
+      tgt_tran_mask, tgt_tran_emb = self.get_embeding_and_mask_before_encoding(
+                                         self.decoder.embeddings, args['tgt_tran'], args['lengths'])
+      return self.encoder(args['src'], args['lengths'],
+                          trans_emb=tgt_tran_emb, trans_mask=tgt_tran_mask)
   
-  def mlm_prob_sampling(self):
-    prob_l = [i for i in range(15, 60, 1)]
-    prob = random.sample(prob_l, 1)[0]
-    return prob / 100
-
-  def mask_tokens_with_spec_mask(self, inputs, spec_mask, enc_type="tran"):
-    if enc_type == "tran":
-      embeddings = self.decoder.embeddings
-    elif enc_type == "mlm":
-      embeddings = self.mlm_decoder.embeddings
-    else:
-      embeddings = self.encoder.embeddings
-   
-    labels = inputs.clone() # [bs, seq_len]
-    masked_indices = spec_mask.bool()
-    labels[~masked_indices] = embeddings.word_padding_idx  # We only compute loss on masked tokens
-    inputs[masked_indices] = embeddings.mask_word_idx
-    # The rest of the time (10% of the time) we keep the masked input tokens unchanged
-    return inputs.transpose(0, 1).contiguous(), labels.transpose(0, 1).contiguous()
-
-  def mask_tokens(self, inputs, mlm_probability=0.15, enc_type="tran"):
-    # inputs: [bs, seq_len]
-    if enc_type == "tran":
-      embeddings = self.decoder.embeddings
-    elif enc_type == "mlm":
-      embeddings = self.mlm_decoder.embeddings
-    else:
-      embeddings = self.encoder.embeddings
-
-
-    def special_mask(in_l, special_l):
-      return [1 if val in special_l else 0 for val in in_l]
-   
-    labels = inputs.clone() # [bs, seq_len]
-    device = inputs.device
-    probability_matrix = torch.full(labels.shape, mlm_probability)# [bs, seq_len]
-    special_tokens_mask = [special_mask(val, embeddings.special_tokens_idxs) for val in labels.tolist()] #[bs, seq_len]
-
-    special_tokens_mask = torch.tensor(special_tokens_mask, dtype=torch.bool)
-
-    probability_matrix.masked_fill_(special_tokens_mask, value=0.0) # [bs, seq_len]
-    masked_indices = torch.bernoulli(probability_matrix).bool()
-    labels[~masked_indices] = embeddings.word_padding_idx  # We only compute loss on masked tokens
+    if task_type == "src_enc":
+      return self.encoder(args['src'], args['lengths'])
     
-    # 80% of the time, we replace masked input tokens with tokenizer.mask_token ([MASK])
-    indices_replaced = torch.bernoulli(torch.full(labels.shape, 0.8)).bool() & masked_indices
-    inputs[indices_replaced] = embeddings.mask_word_idx
+    if task_type == "tgt_enc":
+      tgt_tran_mask, tgt_tran_emb = self.get_embeding_and_mask_before_encoding(
+                                         self.decoder.embeddings, args['tgt_tran'], args['lengths'])
+      return self.encoder(src_length=args['lengths'], trans_emb=tgt_tran_emb, trans_mask=tgt_tran_mask)
 
-    # 10% of the time, we replace masked input tokens with random word
-    indices_random = torch.bernoulli(torch.full(labels.shape, 0.5)).bool() & masked_indices & ~indices_replaced
-    random_words = torch.randint(embeddings.word_vocab_size, labels.shape, dtype=torch.long, device=device)
-    indices_random.to(device)
-    inputs[indices_random] = random_words[indices_random]
 
-    # The rest of the time (10% of the time) we keep the masked input tokens unchanged
-    return inputs.transpose(0, 1).contiguous(), labels.transpose(0, 1).contiguous()
-  
-  def noisy_input(self, inputs, noise_prob=0.15):
-    embeddings = self.mlm_decoder.embeddings
+  def auto_truth_dis_loss(self, v1, v2, distance_fc="euclidean"):
     
-    def special_mask(in_l, special_l):
-      return [1 if val in special_l else 0 for val in in_l]
-   
-    labels = inputs.clone() # [bs, seq_len]
-    device = inputs.device
-    probability_matrix = torch.full(labels.shape, noise_prob)# [bs, seq_len]
-    special_tokens_mask = [special_mask(val, embeddings.special_tokens_idxs) for val in labels.tolist()] #[bs, seq_len]
+    if distance_fc == "euclidean":
+      app_dis_loss = F.pairwise_distance(self.transfer_layer(v1), self.transfer_layer(v2), keepdim=True) # [doc_num * sent_num, 1]
+    
+    if distance_fc == "cosine":
+      app_dis_loss = 1.0 - F.cosine_similarity(self.transfer_layer(v1), self.transfer_layer(v2)).unsqueeze(-1)
+    
+    if distance_fc == "dot_prod":
+      app_dis_loss = 1.0 - F.sigmoid(torch.mul(self.transfer_layer(v2)), self.transfer_layer(v2)).sum(dim=-1, keepdim=True)
+    
+    return app_dis_loss
 
-    special_tokens_mask = torch.tensor(special_tokens_mask, dtype=torch.bool)
+  def multitask_pass(self, src, tgt, tgt_tran, src_lengths):
+    current_batch = random.choice([0, 1, 2])
+    if current_batch == 0: # only fixed training
+      tgt_tran_mask, tgt_tran_emb = self.get_embeding_and_mask_before_encoding(self.decoder.embeddings, tgt_tran, src_lengths)
+      _, _, _, auto_trans_out, _ = self.encoder(src_length=src_lengths, trans_emb=tgt_tran_emb, trans_mask=tgt_tran_mask)
+      self.decoder.init_state(auto_trans_bank=auto_trans_out, auto_trans_mask=tgt_tran_mask)
+      dec_out, attns, z = self.decoder(tgt[:-1], sent_num=src_lengths.size(-1))
+      return dec_out, attns, None, None, z
 
-    probability_matrix.masked_fill_(special_tokens_mask, value=0.0) # [bs, seq_len]
-    noise_indices = torch.bernoulli(probability_matrix).bool()
-    random_words = torch.randint(embeddings.word_vocab_size, labels.shape, dtype=torch.long, device=device)
-    inputs[noise_indices] = random_words[noise_indices]
+    if current_batch == 1: # only context-aware training
+      _, memory_bank, enc_mask, _ = self.encoder(src, src_length=src_lengths)
+      self.decoder.init_state(src, memory_bank, enc_mask)
+      dec_out, attns, z = self.decoder(tgt[:-1], sent_num=src_lengths.size(-1))
+      return dec_out, attns, None, None, z
+    
+    if current_batch == 2: # both training
+      tgt_tran_mask, tgt_tran_emb = self.get_embeding_and_mask_before_encoding(self.decoder.embeddings, tgt_tran, src_lengths)
+      _, memory_bank, enc_mask, auto_trans_out, _ = self.encoder(src, src_length=src_lengths, auto_trans_emb=tgt_tran_emb, auto_trans_mask=tgt_tran_mask)
+      self.decoder.init_state(src, memory_bank, enc_mask, auto_trans_bank=auto_trans_out, auto_trans_mask=tgt_tran_mask)
+      dec_out, attns, z = self.decoder(tgt[:-1], sent_num=src_lengths.size(-1))
+      return dec_out, attns, None, None, z
 
-    # The rest of the time (10% of the time) we keep the masked input tokens unchanged
-    return inputs
-
-  def forward(self, src, tgt, tgt_tran=None, src_lengths=None, only_nmt=False):
+  def forward(self, src, tgt, tgt_tran=None, src_lengths=None):
     # tgt = tgt[:-1]  # exclude last target from inputs
     # _, memory_bank, enc_mask = self.encoder(src, src_lengths)
     
-    if self.use_auto_trans:
-      tgt_tran_mask, tgt_tran_emb = self.get_embeding_and_mask_before_encoding(self.decoder.embeddings, tgt_tran, src_lengths)
-      if self.only_fixed:
-        _, memory_bank, enc_mask, auto_trans_out = self.encoder(src, src_length=src_lengths, auto_trans_emb=tgt_tran_emb, auto_trans_mask=tgt_tran_mask, only_trans_encoding=True)
-      
-      else:
-        _, memory_bank, enc_mask, auto_trans_out = self.encoder(src, src_length=src_lengths, auto_trans_emb=tgt_tran_emb, auto_trans_mask=tgt_tran_mask)
-      
-    if not self.use_auto_trans or self.sentence_level:
-      _, memory_bank, enc_mask, _ = self.encoder(src, src_length=src_lengths)
-      tgt_tran_mask, auto_trans_out = None, None
+    # multi_task training mode
+    if self.multi_task_training:
+      return self.multitask_pass(src, tgt, tgt_tran, src_lengths)
+    
 
+    app_dis_loss = 0.0
+    auto_cls_hidden = None
+    src_cls_hidden = None
+    # encoder pass for making auto translaiton approach the truth translsation. / unified only
+    if self.cross_attn:
+      # tgt_enc = tgt.clone()
+      # tgt_enc[0, :] = src[0, 0]
+      # _, _, _, truth_out, truth_mask = self.encoder_forward(task_type="tgt_enc", \
+      #                                 lengths=src_lengths, tgt_tran=tgt_enc)
+      _, memory_bank, src_mask, trans_out, trans_mask= self.encoder_forward(task_type="unified_enc", \
+                                      lengths=src_lengths, src=src, tgt_tran=tgt_tran)
+      if self.auto_truth_trans_kl:
+        auto_avg_hidden, _ = self.avg_pooling_with_mask(trans_out.transpose(0, 1), trans_mask)
+        auto_cls_hidden = self.transfer_layer(auto_avg_hidden) # [doc_, dim]
+        if self.src_mlm:
+          src_avg_hidden, _ = self.avg_pooling_with_mask(memory_bank.transpose(0, 1), src_mask)
+          src_cls_hidden = self.transfer_layer(src_avg_hidden)
+      # trans_avg_out, loss_mask = self.avg_pooling_with_mask(trans_out.transpose(0, 1), trans_mask)
+      # truth_avg_out, _ = self.avg_pooling_with_mask(truth_out.transpose(0, 1), truth_mask)
+      # app_dis_loss = self.auto_truth_dis_loss(trans_avg_out, truth_avg_out.detach(), self.distance_fc)
+      # app_dis_loss = (app_dis_loss * (1 - loss_mask.float())).sum() / (1 - loss_mask.float()).sum()
+      self.decoder.init_state(src, memory_bank, src_mask, 
+                              auto_trans_bank=trans_out, 
+                              auto_trans_mask=trans_mask,
+                              src_cls_hidden=src_avg_hidden,
+                              auto_cls_hidden=auto_avg_hidden)
+                              
+    # encoder pass for DocRepair
     if self.only_fixed:
-      self.decoder.init_state(tgt_tran, auto_trans_out, tgt_tran_mask)
+      assert(self.auto_truth_trans_kl == 0)
+      _, _, _, trans_out, trans_mask = self.encoder_forward(task_type="tgt_enc", \
+                           lengths=src_lengths, tgt_tran=tgt_tran)
+      self.decoder.init_state(auto_trans_out=trans_out, tgt_tran_mask=trans_mask)
+    # encoder pass for SentTrans or DocTrans
+    if self.only_trans:
+      _, memory_bank, src_mask, _, _ = self.encoder_forward(task_type="src_enc", \
+                           lengths=src_lengths, src=src)
+      self.decoder.init_state(src, memory_bank, src_mask)
     
-    if self.use_auto_trans and not self.only_fixed:
-      self.decoder.init_state(src, memory_bank, enc_mask, auto_trans_bank=auto_trans_out, auto_trans_mask=tgt_tran_mask)
-    
-    if self.sentence_level or not self.use_auto_trans:
-      self.decoder.init_state(src, memory_bank, enc_mask)
-    dec_out, attns, _ = self.decoder(tgt[:-1], sent_num=src_lengths.size(-1))
-  
-    if self.mlm_distill and not only_nmt:
-      # tgt_tran_distill_mask, tgt_tran_distill_emb = self.get_embeding_and_mask_before_encoding(self.mlm_decoder.embeddings, tgt_tran, src_lengths)
-      # _, distill_memory_bank, distill_enc_mask, noise_tgt_out = self.encoder(src, src_length=src_lengths, auto_trans_emb=tgt_tran_distill_emb, auto_trans_mask=tgt_tran_distill_mask)
-      self.mlm_decoder.init_state(src, memory_bank, enc_mask, auto_trans_bank=auto_trans_out, auto_trans_mask=tgt_tran_mask)
-      # self.mlm_decoder.init_state(src, distill_memory_bank, distill_enc_mask, auto_trans_bank=noise_tgt_out, auto_trans_mask=tgt_tran_distill_mask)
-      mlm_prob = self.mlm_prob_sampling()
-      mlm_inputs, mlm_labels = self.mask_tokens(tgt[1:].clone().transpose(0, 1), mlm_probability=mlm_prob, enc_type='mlm')
-      mlm_dec_out, attn, _ = self.mlm_decoder(mlm_inputs, sent_num=src_lengths.size(-1), mlm_decoder=True)
-    else:
-      mlm_dec_out = None
-      mlm_labels = None
-    
-    return dec_out, attns, mlm_dec_out, mlm_labels
 
-  def forward_mlm_for_distillation(self, src, tgt, tgt_tran=None, src_lengths=None, mask_id=None):
-    if self.use_auto_trans:
-      tgt_tran_mask, tgt_tran_emb = self.get_embeding_and_mask_before_encoding(self.mlm_decoder.embeddings, tgt_tran, src_lengths)
-      _, memory_bank, enc_mask, auto_trans_out = self.encoder(src, src_length=src_lengths, auto_trans_emb=tgt_tran_emb, auto_trans_mask=tgt_tran_mask)
-      
-    if not self.use_auto_trans or self.sentence_level:
-      _, memory_bank, enc_mask, _ = self.encoder(src, src_length=src_lengths)
-      tgt_tran_mask, auto_trans_out = None, None
-    
-    mlm_inputs, _ = self.mask_tokens_with_spec_mask(tgt[1:].clone().transpose(0, 1), spec_mask=mask_id.transpose(0, 1), enc_type='mlm')
-    self.mlm_decoder.init_state(src, memory_bank, enc_mask, auto_trans_bank=auto_trans_out, auto_trans_mask=tgt_tran_mask)
-    mlm_dec_out, _, _ = self.mlm_decoder(mlm_inputs, sent_num=src_lengths.size(-1), mlm_decoder=True)
-    return mlm_dec_out
+    # decoder pass
+    dec_out, attns, z = self.decoder(tgt[:-1], sent_num=src_lengths.size(-1))
+    # approching loss scale use value of gating 
+    # if self.use_z_contronl:
+    #   app_dis_loss = z * app_dis_loss * self.weight_trans_kl 
+    # else:
+    #   app_dis_loss = app_dis_loss * self.weight_trans_kl
+
+    return dec_out, attns, src_cls_hidden, auto_cls_hidden, z
 
 
 def build_embeddings(opt, word_dict, for_encoder=True):
@@ -272,7 +271,7 @@ def build_base_model(model_opt, fields, gpu, checkpoint=None, opt=None, is_train
   src_dict = fields["src"].vocab
   src_embeddings = build_embeddings(model_opt, src_dict)
   encoder = build_encoder(model_opt, src_embeddings)
-  
+
   # Build decoder.
   tgt_dict = fields["tgt"].vocab
   tgt_embeddings = build_embeddings(model_opt, tgt_dict,
@@ -288,34 +287,25 @@ def build_base_model(model_opt, fields, gpu, checkpoint=None, opt=None, is_train
     tgt_embeddings.word_lut.weight = src_embeddings.word_lut.weight
 
   decoder = build_decoder(model_opt, tgt_embeddings)
+
+  # Build NMTModel(= encoder + decoder).
+  device = torch.device("cuda" if gpu else "cpu")
+  model = NMTModel(encoder, decoder, opt)
+
   # Build Generator.
   gen_func = nn.LogSoftmax(dim=-1)
+  src_gen_func = nn.LogSoftmax(dim=-1)
   generator = nn.Sequential(
     nn.Linear(model_opt.dec_rnn_size, len(fields["tgt"].vocab), bias=False),
     gen_func
   )
-  device = torch.device("cuda" if gpu else "cpu")
-  # if use distillation, init a mlm model for use
-  if model_opt.mlm_distill:
-    # whole distill model
-    # distill_tgt_embeddings = build_embeddings(model_opt, tgt_dict,
-    #                                 for_encoder=False)
-    cmlm_decoder = build_decoder(model_opt, tgt_embeddings)
-    
-    if model_opt.new_gen:
-      cmlm_gen_func = nn.LogSoftmax(dim=-1)
-      cmlm_generator = nn.Sequential(
-        nn.Linear(model_opt.dec_rnn_size, len(fields["tgt"].vocab), bias=False),
-        cmlm_gen_func)
-    else:
-      cmlm_generator = generator
-    # decoder for joint training 
+  if model_opt.src_mlm:
+    src_generator = nn.Sequential(
+      nn.Linear(model_opt.dec_rnn_size, len(fields["src"].vocab), bias=False),
+      src_gen_func
+    )
   else:
-    cmlm_generator = None
-    cmlm_decoder = None
-  # Build NMTModel(= encoder + decoder).
-  
-  model = NMTModel(encoder, decoder, opt, cmlm_decoder)
+    src_generator = None 
 
 
   # Initiate the model
@@ -324,10 +314,9 @@ def build_base_model(model_opt, fields, gpu, checkpoint=None, opt=None, is_train
       p.data.uniform_(-model_opt.param_init, model_opt.param_init)
     for p in generator.parameters():
       p.data.uniform_(-model_opt.param_init, model_opt.param_init)
-    if model_opt.new_gen and model_opt.mlm_distill:
-      for p in cmlm_generator.parameters():
+    if src_generator is not None:
+      for p in src_generator.parameters():
         p.data.uniform_(-model_opt.param_init, model_opt.param_init)
-    
   if model_opt.param_init_glorot:
     for p in model.parameters():
       if p.dim() > 1:
@@ -335,10 +324,9 @@ def build_base_model(model_opt, fields, gpu, checkpoint=None, opt=None, is_train
     for p in generator.parameters():
       if p.dim() > 1:
         xavier_uniform_(p)
-    if model_opt.new_gen and model_opt.mlm_distill:
-      for p in cmlm_generator.parameters():
-        if p.dim() > 1:
-          xavier_uniform_(p)
+    if src_generator is not None:
+      for p in src_generator.parameters():
+        p.data.uniform_(-model_opt.param_init, model_opt.param_init)
         
   # Load the pretrained word vector
   if hasattr(model.encoder, 'embeddings'):
@@ -347,12 +335,6 @@ def build_base_model(model_opt, fields, gpu, checkpoint=None, opt=None, is_train
   if hasattr(model.decoder, 'embeddings'):
     model.decoder.embeddings.load_pretrained_vectors(
         model_opt.pre_word_vecs_dec, model_opt.fix_word_vecs_dec)
-  
-  if model_opt.share_decoder_embeddings:
-    generator[0].weight = decoder.embeddings.word_lut.weight
-  
-  if model_opt.share_mlm_decoder_embeddings:
-    cmlm_generator[0].weight = cmlm_decoder.embeddings.word_lut.weight
   
   # Load the model states from checkpoint.
   if checkpoint is not None:
@@ -367,13 +349,8 @@ def build_base_model(model_opt, fields, gpu, checkpoint=None, opt=None, is_train
     checkpoint['model'] = \
       {fix_key(k): v for (k, v) in checkpoint['model'].items()}
     # end of patch for backward compatibility
-    
-    
+
     model.load_state_dict(checkpoint['model'], strict=False)
-    # load NMT decoder for MLM decoder
-  
-    
-    
     # init all cross attention including in encoder with decoder cross attention.  
     if model_opt.init_cross_sent and is_train:
       logger.info("init all cross attention module with the sentence-level cross attention from decoder ...")
@@ -405,13 +382,13 @@ def build_base_model(model_opt, fields, gpu, checkpoint=None, opt=None, is_train
           model.encoder.transformer[i].doc_att_layer_norm.load_state_dict(cur_self_norm, strict=False)
         
         # init the params in cross attention in encoder with context attention in decoder
-        if not model_opt.share_enc_cross_attn and model_opt.cross_attn:
+        if not model_opt.share_enc_cross_attn:
           logger.info("init the params in not shared cross attention in encoder with context attention in decoder")
           model.encoder.transformer[i].src_auto_attn.load_state_dict(cur_ctx_attn, strict=False)
           model.encoder.transformer[i].auto_src_attn_norm.load_state_dict(cur_ctx_norm, strict=False)
           model.encoder.transformer[i].auto_src_attn.load_state_dict(cur_ctx_attn, strict=False)
           model.encoder.transformer[i].auto_src_attn_norm.load_state_dict(cur_ctx_norm, strict=False)
-        if model_opt.share_enc_cross_attn and model_opt.cross_attn:
+        else:
           logger.info("init the params in shared cross attention in encoder with context attention in decoder")
           model.encoder.transformer[i].cross_lang_attn.load_state_dict(cur_ctx_attn, strict=False)
           model.encoder.transformer[i].cross_lang_att_layer_norm.load_state_dict(cur_ctx_norm, strict=False)   
@@ -424,13 +401,14 @@ def build_base_model(model_opt, fields, gpu, checkpoint=None, opt=None, is_train
           model.decoder.transformer_layers[i].auto_context_attn.load_state_dict(cur_ctx_attn, strict=False)
           model.decoder.transformer_layers[i].auto_enc_att_layer_norm.load_state_dict(cur_ctx_norm, strict=False)
         
-      if model_opt.mlm_distill:
-        logger.info("init the mlm decoder with nmt decoder ... ")
-        decoder_dict = model.decoder.state_dict()
-        model.mlm_decoder.load_state_dict(decoder_dict, strict=False)
-      
 
     generator.load_state_dict(checkpoint['generator'], strict=False)
+    
+  if model_opt.share_decoder_embeddings:
+    generator[0].weight = model.decoder.embeddings.word_lut.weight
+    if model_opt.src_mlm:
+      src_generator[0].weight = model.encoder.embeddings.word_lut.weight
+  
   # else:
   #   if model_opt.param_init != 0.0:
   #     for p in model.parameters():
@@ -454,7 +432,7 @@ def build_base_model(model_opt, fields, gpu, checkpoint=None, opt=None, is_train
   #pdb.set_trace()
   # Add generator to model (this registers it as parameter of model).
   model.generator = generator
-  model.mlm_generator = cmlm_generator
+  model.src_generator = src_generator
   model.to(device)
 
   return model

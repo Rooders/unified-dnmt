@@ -3,24 +3,18 @@ from xml.etree.ElementInclude import default_loader
 from xml.sax import parseString
 
 
-def read_docs(file_name, split_tok="|||"):
+def read_docs(file_name, split_tok=" ||| "):
    file = open(file_name, 'r', encoding="utf-8")
-   docs = []
-   for line in file.readlines():
-      doc = line.split(split_tok)
-      final_doc = ["this is a fake sentence" if sent.strip() == "" else sent.strip() for sent in doc]
-      docs.append(final_doc)
-   # docs = [line.split(split_tok) for line in file.readlines()]
-   # final_doc = ["this is a fake sentence" if line.strip() == "" else line.strip() for line in docs]
+   docs = [line.strip().split(split_tok) for line in file.readlines()]
    file.close()
    return docs
 
-def mini_doc_bulider(src_docs, tgt_docs, tran_docs=None, max_length=512):
+def mini_doc_bulider(src_docs, tgt_docs, tran_docs=None, max_length=1024):
    assert(len(src_docs) == len(tgt_docs) == len(tran_docs))
    all_src_mini_docs = []
    all_tgt_mini_docs = []
    all_tran_mini_docs = []
-   for i, (src_doc, tgt_doc, tran_doc) in enumerate(zip(src_docs, tgt_docs, tran_docs)):
+   for src_doc, tgt_doc, tran_doc in zip(src_docs, tgt_docs, tran_docs):
      assert(len(src_doc) == len(tgt_doc) == len(tran_doc))
      min_src_docs = []
      min_src_doc = []
@@ -60,7 +54,7 @@ def main(args):
    src_docs = read_docs(args.src_doc_path)
    tgt_docs = read_docs(args.tgt_doc_path)
    tran_docs = read_docs(args.tran_doc_path)
-   mini_src_docs, mini_tgt_docs, mini_tran_docs = mini_doc_bulider(src_docs, tgt_docs, tran_docs, args.max_length)
+   mini_src_docs, mini_tgt_docs, mini_tran_docs = mini_doc_bulider(src_docs, tgt_docs, tran_docs)
    src_mini_file = open(args.src_doc_path + ".mini", 'w', encoding='utf-8')
    tgt_mini_file = open(args.tgt_doc_path + ".mini", 'w', encoding='utf-8')
    tran_mini_file = open(args.tran_doc_path + ".mini", 'w', encoding='utf-8')
@@ -77,8 +71,6 @@ if __name__ == '__main__':
    parser.add_argument("--src_doc_path", type=str, required=True, help="split token of paired translation")
    parser.add_argument("--tgt_doc_path", type=str, required=True, help="path of paired translation")
    parser.add_argument("--tran_doc_path", type=str, default="", help="path of file to store")
-   parser.add_argument("--max_length", type=int, default=512, help="the max number of token in per document")
-   
    args = parser.parse_args()
    main(args)
 

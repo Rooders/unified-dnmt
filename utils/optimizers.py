@@ -192,29 +192,21 @@ class Optimizer(object):
         self.original_lr = learning_rate
         self.max_grad_norm = max_grad_norm
         self.method = method
-        
         self.lr_decay = lr_decay
         self.start_decay_steps = start_decay_steps
         self.decay_steps = decay_steps
         self.start_decay = False
-        
         self._step = 0
         self.betas = [beta1, beta2]
         self.adagrad_accum = adagrad_accum
         self.decay_method = decay_method
-        
         self.warmup_steps = warmup_steps
         self.model_size = model_size
         self.mixed_precision = mixed_precision
         
         self.doc_double_lr = doc_double_lr
         self.doc_lr = doc_lr
-        # for inverse_sqrt LR
-        if self.decay_method == "inverse_sqrt":
-          self.learn_rate = 0.0
-        self.lr_step = self.original_lr / self.warmup_steps 
-        self.decay_factor = self.original_lr * self.warmup_steps ** 0.5
-
+        
     def set_parameters(self, params, params_g=[]):
         """ ? """
         self.params = []
@@ -224,8 +216,8 @@ class Optimizer(object):
         
         if params_g:
            self.params = params_g
-           self.params[0]['lr'] = self.learning_rate * self.doc_lr
-           self.params[1]['lr'] = self.learning_rate
+           self.params[0]['lr'] = self.learning_rate
+           self.params[1]['lr'] = self.learning_rate * self.doc_lr
         else:
            for k, p in params:
                if p.requires_grad:
@@ -278,27 +270,28 @@ class Optimizer(object):
         if self.method != 'sparseadam':
             self.optimizer.param_groups[0]['lr'] = self.learning_rate
             if self.doc_double_lr:
-              self.optimizer.param_groups[0]['lr'] = self.learning_rate * self.doc_lr
-              self.optimizer.param_groups[1]['lr'] = self.learning_rate 
+              self.optimizer.param_groups[1]['lr'] = self.learning_rate * self.doc_lr
         else:
             for op in self.optimizer.optimizers:
                 op.param_groups[0]['lr'] = self.learning_rate
                 if self.doc_double_lr:
-                  op.param_groups[0]['lr'] = self.learning_rate * self.doc_lr
-                  op.param_groups[1]['lr'] = self.learning_rate
-    
-    def update_lr(self):
+                  op.param_groups[1]['lr'] = self.learning_rate * self.doc_lr
+
+    def step(self):
+        """Update the model parameters based on current gradients.
+
+        Optionally, will employ gradient modification or update learning
+        rate.
+        """
+        self._step += 1
+
         # Decay method used in tensor2tensor.
         if self.decay_method == "noam":
-            self.learn_rate = self.original_lr * (self.model_size ** (-0.5) * min(self._step ** (-0.5), self._step * self.warmup_steps**(-1.5)))
-        
-        # Decay method in fairseq
-        elif self.decay_method == "inverse_sqrt":
-          if self._step <= self.warmup_steps:
-            self.learn_rate = self.lr_step + self.learn_rate
-          else:
-            self.learn_rate = self.decay_factor * self._step**(-0.5)
-        
+            self._set_rate(
+                self.original_lr *
+                (self.model_size ** (-0.5) *
+                 min(self._step ** (-0.5),
+                     self._step * self.warmup_steps**(-1.5))))
         # Decay based on start_decay_steps every decay_steps
         else:
             if ((self.start_decay_steps is not None) and (
@@ -309,22 +302,10 @@ class Optimizer(object):
                    % self.decay_steps == 0):
                     self.learning_rate = self.learning_rate * self.lr_decay
 
-    def step(self):
-        """Update the model parameters based on current gradients.
-
-        Optionally, will employ gradient modification or update learning
-        rate.
-        """
-        self._step += 1
-
-        
-        self.update_lr()
-        self._set_rate(self.learn_rate)
-        # if self.method != 'sparseadam':
-        #     self._
-        #     self.optimizer.param_groups[0]['lr'] = self.learning_rate
-        #     if self.doc_double_lr:
-        #       self.optimizer.param_groups[1]['lr'] = self.learning_rate * self.doc_lr
+        if self.method != 'sparseadam':
+            self.optimizer.param_groups[0]['lr'] = self.learning_rate
+            if self.doc_double_lr:
+              self.optimizer.param_groups[1]['lr'] = self.learning_rate * self.doc_lr
         
         if self.mixed_precision and self.max_grad_norm > 0:
           self.scaler.unscale_(self.optimizer)

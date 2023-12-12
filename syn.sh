@@ -7,5 +7,4 @@ git commit -m 'add some code from Mac'
 git push origin main            #upload data
 git stash pop
 
-"test the change"
 

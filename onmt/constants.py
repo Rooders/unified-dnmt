@@ -1,6 +1,7 @@
 PAD_WORD = '<blank>'
 UNK_WORD = '<unk>'
 SLU_WORD = '<slu>'
+TLU_WORD = '<tlu>'
 SEG_WORD = '<seg>'
 BOS_WORD = '<s>'
 EOS_WORD = '</s>'

@@ -19,7 +19,7 @@ from inputters.dataset import make_features
 import torch
 
 def build_trainer(opt, device_id, model, fields,
-                  optim, model_saver=None, mlm_model=None):
+                  optim, model_saver=None):
   """
   Simplify `Trainer` creation based on user `opt`s*
 
@@ -32,18 +32,15 @@ def build_trainer(opt, device_id, model, fields,
           used to save the model
   """
   train_loss = build_loss_compute(
-    model, fields["tgt"].vocab, fields["src"].vocab, opt)
+    model, fields["tgt"].vocab, fields['src'].vocab, opt)
   valid_loss = build_loss_compute(
-    model, fields["tgt"].vocab, fields["src"].vocab, opt, train=False)
-  
+    model, fields["tgt"].vocab, fields['src'].vocab, opt, train=False)
+
   trunc_size = opt.truncated_decoder  # Badly named...
   shard_size = opt.max_generator_batches
   norm_method = opt.normalization
   grad_accum_count = opt.accum_count
   use_auto_trans = opt.use_auto_trans
-  mlm_distill = opt.mlm_distill
-  start_distill_step = opt.start_distill_step
-  distill_annealing = opt.distill_annealing
   n_gpu = opt.world_size
   if device_id >= 0:
     gpu_rank = opt.gpu_ranks[device_id]
@@ -57,7 +54,7 @@ def build_trainer(opt, device_id, model, fields,
                          shard_size, norm_method,
                          grad_accum_count, n_gpu, gpu_rank,
                          gpu_verbose_level, report_manager,
-                         model_saver=model_saver, use_auto_trans=use_auto_trans, mlm_distill=mlm_distill, start_distill_step=start_distill_step, distill_annealing=distill_annealing, mlm_model=mlm_model)
+                         model_saver=model_saver, use_auto_trans=use_auto_trans)
   return trainer
 
 
@@ -88,7 +85,7 @@ class Trainer(object):
   def __init__(self, model, train_loss, valid_loss, optim,
                trunc_size=0, shard_size=32,
                norm_method="sents", grad_accum_count=1, n_gpu=1, gpu_rank=1,
-               gpu_verbose_level=0, report_manager=None, model_saver=None, use_auto_trans=0, mlm_distill=False, start_distill_step=100000, distill_annealing=False, mlm_model=None):
+               gpu_verbose_level=0, report_manager=None, model_saver=None, use_auto_trans=0):
     # Basic attributes.
     self.model = model
     self.train_loss = train_loss
@@ -104,10 +101,7 @@ class Trainer(object):
     self.report_manager = report_manager
     self.model_saver = model_saver
     self.use_auto_trans = use_auto_trans
-    self.mlm_distill = mlm_distill
-    self.start_distill_step = start_distill_step
-    self.distill_annealing = distill_annealing
-    self.mlm_model = mlm_model
+    
     assert grad_accum_count > 0
     if grad_accum_count > 1:
       assert(self.trunc_size == 0), \
@@ -144,51 +138,24 @@ class Trainer(object):
     train_iter = train_iter_fct()
     total_stats = Statistics()
     report_stats = Statistics()
-    mlm_total_stats = Statistics()
-    mlm_report_stats = Statistics()
+    fixed_trans_total_stats = Statistics()
+    fixed_trans_report_stats = Statistics()
     self._start_report_manager(start_time=total_stats.start_time)
-    freeze_mlm = False
-    
-    if self.distill_annealing and self.mlm_distill:
-      annealing_step = train_steps - self.start_distill_step
-    else:
-      annealing_step = 0
-    
+
     while step <= train_steps:
       reduce_counter = 0
       for i, batch in enumerate(train_iter):
-        if self.mlm_distill:
-          only_nmt = step > self.start_distill_step
-          if only_nmt and self.distill_annealing:
-            annealing_coef = (step - self.start_distill_step) / annealing_step
-          else:
-            annealing_coef = None  
-          # fix the mlm_decoder only for distillation
-          if only_nmt and not freeze_mlm:
-            self.mlm_model.encoder.load_state_dict(self.model.encoder.state_dict())
-            self.mlm_model.mlm_decoder.load_state_dict(self.model.mlm_decoder.state_dict())
-            self.mlm_model.mlm_generator.load_state_dict(self.model.mlm_generator.state_dict())
-            self.mlm_model.eval()
 
-            print("logger info: mlm model have been enable and its parameters have been fixed.")
-            for p in self.mlm_model.parameters():
-              p.requires_grad = False
-            freeze_mlm = True
-        
-        else:
-          only_nmt = False
-          annealing_coef = 1.0
-        
         # if batch is document-level, need to reshape shape of data
         if len(batch.tgt.shape) > 2:
           num_doc, num_sents = batch.tgt.size(0), batch.tgt.size(1)
           batch.src = list(batch.src)
-          batch.src[0] = batch.src[0].view(num_doc * num_sents, -1).transpose(0, 1).contiguous() #(seq_len, sents_num)
-          batch.tgt = batch.tgt.view(num_doc * num_sents, -1).transpose(0, 1).contiguous() #(seq_len, sents_num)
+          batch.src[0] = batch.src[0].view(num_doc * num_sents, -1).transpose(0, 1) #(seq_len, sents_num)
+          batch.tgt = batch.tgt.view(num_doc * num_sents, -1).transpose(0, 1) #(seq_len, sents_num)
           batch.src = tuple(batch.src)
           
           if self.use_auto_trans:
-            batch.tgt_tran = batch.tgt_tran.view(num_doc * num_sents, -1).transpose(0, 1).contiguous() #(seq_len, sents_num)
+            batch.tgt_tran = batch.tgt_tran.view(num_doc * num_sents, -1).transpose(0, 1) #(seq_len, sents_num)
 
         if self.n_gpu == 0 or (i % self.n_gpu == self.gpu_rank):
           if self.gpu_verbose_level > 1:
@@ -211,25 +178,23 @@ class Trainer(object):
                           n_minibatch %d"
                           % (self.gpu_rank, reduce_counter,
                              len(true_batchs)))
-            # if self.n_gpu > 1:
-            #   normalization = sum(all_gather_list
-            #                         (normalization))
-            
-            
+            if self.n_gpu > 1:
+              normalization = sum(all_gather_list
+                                    (normalization))
+
             self._gradient_accumulation(
               true_batchs, normalization, total_stats,
-              report_stats, mlm_total_stats, mlm_report_stats, only_nmt=only_nmt, annealing_coef=annealing_coef)
+              report_stats, fixed_trans_total_stats, fixed_trans_report_stats)
 
             report_stats = self._maybe_report_training(
               step, train_steps,
               self.optim.learning_rate,
               report_stats)
-            if not only_nmt and self.mlm_distill:
-              mlm_report_stats = self._maybe_report_training(
-                step, train_steps,
-                self.optim.learning_rate,
-                mlm_report_stats)
             
+            # fixed_trans_report_stats = self._maybe_report_training(
+            #   step, train_steps,
+            #   self.optim.learning_rate,
+            #   fixed_trans_report_stats)
 
             true_batchs = []
             accum = 0
@@ -239,23 +204,19 @@ class Trainer(object):
                 logger.info('GpuRank %d: validate step %d'
                               % (self.gpu_rank, step))
               valid_iter = valid_iter_fct()
-              valid_stats, mlm_valid_stats = self.validate(valid_iter)
+              valid_stats, fixed_stats = self.validate(valid_iter)
               if self.gpu_verbose_level > 0:
                 logger.info('GpuRank %d: gather valid stat \
                               step %d' % (self.gpu_rank, step))
               valid_stats = self._maybe_gather_stats(valid_stats)
-              if self.mlm_distill:
-                mlm_valid_stats = self._maybe_gather_stats(mlm_valid_stats)
-          
+              # fixed_stats = self._maybe_gather_stats(fixed_stats)
               if self.gpu_verbose_level > 0:
                 logger.info('GpuRank %d: report stat step %d'
                               % (self.gpu_rank, step))
               self._report_step(self.optim.learning_rate,
                                 step, valid_stats=valid_stats)
-              if self.mlm_distill:
-                self._report_step(self.optim.learning_rate,
-                                  step, valid_stats=mlm_valid_stats)
-            
+              # self._report_step(self.optim.learning_rate,
+              #                   step, valid_stats=fixed_stats)
 
             if self.gpu_rank == 0:
               self._maybe_save(step)
@@ -267,7 +228,7 @@ class Trainer(object):
                     at step %d' % (self.gpu_rank, step))
       train_iter = train_iter_fct()
 
-    return total_stats, mlm_total_stats
+    return total_stats, fixed_trans_total_stats
 
   def validate(self, valid_iter):
     """ Validate model.
@@ -279,17 +240,17 @@ class Trainer(object):
     self.model.eval()
 
     stats = Statistics()
-    mlm_stats = Statistics()
+    fixed_stats = Statistics()
     for batch in valid_iter:
       # if document-level, need to proprecess batch
       if len(batch.tgt.shape) > 2:
         num_doc, num_sents = batch.tgt.size(0), batch.tgt.size(1)
         batch.src = list(batch.src)
-        batch.src[0] = batch.src[0].view(num_doc * num_sents, -1).transpose(0, 1).contiguous()  # (seq_len, sents_num)
-        batch.tgt = batch.tgt.view(num_doc * num_sents, -1).transpose(0, 1).contiguous()  # (seq_len, sents_num)
+        batch.src[0] = batch.src[0].view(num_doc * num_sents, -1).transpose(0, 1)  # (seq_len, sents_num)
+        batch.tgt = batch.tgt.view(num_doc * num_sents, -1).transpose(0, 1)  # (seq_len, sents_num)
         batch.src = tuple(batch.src)
         if self.use_auto_trans:
-          batch.tgt_tran = batch.tgt_tran.view(num_doc * num_sents, -1).transpose(0, 1).contiguous() #(seq_len, sents_num)
+          batch.tgt_tran = batch.tgt_tran.view(num_doc * num_sents, -1).transpose(0, 1) #(seq_len, sents_num)
       src = make_features(batch, 'src')
       if len(batch.src) > 2:
           _, _, src_lengths = batch.src
@@ -304,25 +265,24 @@ class Trainer(object):
         tgt_tran = None
       # F-prop through the model.
       with torch.no_grad():
-        outputs, attns, mlm_outputs, mlm_labels = self.model(src, tgt, tgt_tran, src_lengths)
+        outputs, attns, src_cls_hidden, auto_cls_hidden, enc_loss = self.model(src, tgt, tgt_tran, src_lengths)
 
       # Compute loss.
-        batch_stats, mlm_batch_stats = self.valid_loss.monolithic_compute_loss(
-          batch, outputs, attns, mlm_outputs, mlm_labels)
+        batch_stats, fixed_batch_stats = self.valid_loss.monolithic_compute_loss(
+          batch, outputs, attns, src_cls_hidden, auto_cls_hidden, enc_loss)
 
       # Update statistics.
       stats.update(batch_stats)
-      if mlm_batch_stats is not None:
-        mlm_stats.update(mlm_batch_stats)
-      
+      # if fixed_stats is not None:
+      #   fixed_stats.update(fixed_batch_stats)
 
     # Set model back to training mode.
     self.model.train()
 
-    return stats, mlm_stats
-  
+    return stats, fixed_stats
+
   def _gradient_accumulation(self, true_batchs, normalization, total_stats,
-                             report_stats, mlm_total_stats, mlm_report_stats, only_nmt=False, annealing_coef=1.0):
+                             report_stats, fixed_total_stats, fixed_report_stats):
       if self.grad_accum_count > 1:
           self.model.zero_grad()
       for batch in true_batchs:
@@ -350,54 +310,32 @@ class Trainer(object):
               # 2. F-prop all but generator.
               if self.grad_accum_count == 1:
                   self.model.zero_grad()
-              # only_nmt = self.optim._step > self.mlm_train_step
+              
               if self.optim.mixed_precision:
                 with torch.cuda.amp.autocast():
-                  outputs, attns, mlm_outputs, mlm_labels = \
-                      self.model(src, tgt, tgt_tran, src_lengths, only_nmt=only_nmt)
+                  outputs, attns, src_cls_hidden, auto_cls_hidden, enc_loss = \
+                      self.model(src, tgt, tgt_tran, src_lengths)
               else:
-                outputs, attns, mlm_outputs, mlm_labels = \
-                      self.model(src, tgt, tgt_tran, src_lengths, only_nmt=only_nmt)
-              
+                outputs, attns, src_cls_hidden, auto_cls_hidden, enc_loss = \
+                      self.model(src, tgt, tgt_tran, src_lengths)
+              # outputs, attns = \
+              #     self.model(src, tgt, src_lengths)
               # 3. Compute loss in shards for memory efficiency.
               if self.optim.mixed_precision:
                 with torch.cuda.amp.autocast():
-                  if only_nmt:
-                    # select_prob_mask: [seq_len, batch_size], nmt_prob: [seq_len * batch_size, vocab_size]
-                    nmt_prob, select_prob_mask = self.train_loss.only_compute_prob(outputs, tgt, select_prob=True)
-                    with torch.no_grad():
-                      mlm_out = self.mlm_model.forward_mlm_for_distillation(src, tgt, tgt_tran, src_lengths, mask_id=select_prob_mask)
-                      mlm_prob, _ = self.train_loss.only_compute_prob(mlm_out, gen=self.mlm_model.mlm_generator)
-                    
-                    batch_stats = self.train_loss.compute_distillation_loss(tgt, nmt_prob, mlm_prob.detach(), select_prob_mask, \
-                                                     normalization, self.optim.scaler, annealing_coef=annealing_coef)
-                    mlm_stats = None
-                  else:
-                    batch_stats, mlm_stats = self.train_loss.sharded_compute_loss(
-                        batch, outputs, attns, j,
-                        trunc_size, self.shard_size, normalization, self.optim.scaler, mlm_outputs, mlm_labels, self.grad_accum_count * self.n_gpu)
-              else:
-                if only_nmt:
-                  # select_prob_mask: [seq_len, batch_size], nmt_prob: [seq_len * batch_size, vocab_size]
-                  nmt_prob, select_prob_mask = self.train_loss.only_compute_prob(outputs, tgt, select_prob=True)
-                  with torch.no_grad():
-                    outputs = self.mlm_model.forward_mlm_for_distillation(src, tgt, tgt_tran, src_lengths, mask_id=select_prob_mask)
-                    mlm_prob, _ = self.train_loss.only_compute_prob(mlm_out, gen=self.mlm_model.mlm_generator)
-                  
-                  batch_stats = self.train_loss.compute_distillation_loss(tgt, nmt_prob, mlm_prob.detach(), select_prob_mask, \
-                                                    normalization, self.optim.scaler, annealing_coef=annealing_coef)
-                  mlm_stats = None
-                else:
-                  batch_stats, mlm_stats = self.train_loss.sharded_compute_loss(
+                  batch_stats, fixed_stats = self.train_loss.sharded_compute_loss(
                       batch, outputs, attns, j,
-                      trunc_size, self.shard_size, normalization, self.optim.scaler, mlm_outputs, mlm_labels, self.grad_accum_count * self.n_gpu)
+                      trunc_size, self.shard_size, normalization, self.optim.scaler, src_cls_hidden, auto_cls_hidden, enc_loss, self.grad_accum_count * self.n_gpu)
+              else:
+                batch_stats, fixed_stats = self.train_loss.sharded_compute_loss(
+                      batch, outputs, attns, j,
+                      trunc_size, self.shard_size, normalization, None, src_cls_hidden, auto_cls_hidden, enc_loss, self.grad_accum_count * self.n_gpu)
               
               total_stats.update(batch_stats)
               report_stats.update(batch_stats)
-              if mlm_stats is not None:
-                mlm_total_stats.update(mlm_stats)
-                mlm_report_stats.update(mlm_stats)
-              
+              if fixed_stats is not None:
+                fixed_total_stats.update(fixed_stats)
+                fixed_report_stats.update(fixed_stats)
 
               # 4. Update the parameters and statistics.
               if self.grad_accum_count == 1:
