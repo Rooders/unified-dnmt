@@ -279,7 +279,7 @@ class TransformerDecoder(nn.Module):
     output = emb.transpose(0, 1).contiguous()
     pad_idx = self.embeddings.word_padding_idx
     tgt_pad_mask = tgt_words.data.eq(pad_idx).unsqueeze(1)  # [B, 1, T_tgt]
-    src_cls_mask = auto_cls_mask = src_pad_mask.logical_not().sum(2, keepdim=True) == 0
+    # src_cls_mask = auto_cls_mask = src_pad_mask.logical_not().sum(2, keepdim=True) == 0
     z = 0.0    
     for i in range(self.num_layers):
       output, attn, z = self.transformer_layers[i](

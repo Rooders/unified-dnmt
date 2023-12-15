@@ -172,7 +172,7 @@ class NMTModel(nn.Module):
                            lengths=src_lengths, tgt_tran=tgt_tran)
       self.decoder.init_state(auto_trans_bank=trans_out, auto_trans_mask=trans_mask)
       dec_out, attns, z = self.decoder(tgt[:-1], sent_num=src_lengths.size(-1))
-      return {"repair_out":dec_out, 
+      return {"repair_out":dec_out,
               "trans_out":None,
               "attns": attns}
     # encoder pass for SentTrans or DocTrans
