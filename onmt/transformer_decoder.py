@@ -273,9 +273,9 @@ class TransformerDecoder(nn.Module):
     # print(src_memory_bank.shape) 
     src_pad_mask = self.state["src_mask"]  # [B, 1, T_src]
     auto_trans_mask = self.state["auto_trans_mask"]
-    src_cls_mask = self.state["src_cls_mask"]  # [B, 1, T_src]
-    auto_cls_mask = self.state["auto_cls_mask"]
-    # Input of Decoder
+    # src_cls_mask = self.state["src_cls_mask"]  # [B, 1, T_src]
+    # auto_cls_mask = self.state["auto_cls_mask"]
+    # # Input of Decoder
     output = emb.transpose(0, 1).contiguous()
     pad_idx = self.embeddings.word_padding_idx
     tgt_pad_mask = tgt_words.data.eq(pad_idx).unsqueeze(1)  # [B, 1, T_tgt]
@@ -291,9 +291,7 @@ class TransformerDecoder(nn.Module):
           self.state["cache"]["layer_{}".format(i)]
           if step is not None else None),
         step=step, beam_size=beam_size,
-        auto_trans_bank=auto_trans_bank, auto_trans_mask=auto_trans_mask,
-        src_cls_hidden=src_cls_hidden, auto_cls_hidden=auto_cls_hidden,
-        src_cls_mask=src_cls_mask, auto_cls_mask=auto_cls_mask)
+        auto_trans_bank=auto_trans_bank, auto_trans_mask=auto_trans_mask)
       z = z + z
 
     z = z / self.gate_avg_num
