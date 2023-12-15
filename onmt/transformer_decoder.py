@@ -16,9 +16,9 @@ class TransformerDecoderLayer(nn.Module):
   def __init__(self, d_model, heads, d_ff, dropout, model_opt=None, layer_idx=None):
     super(TransformerDecoderLayer, self).__init__()
     self.use_auto_trans = model_opt.use_auto_trans
-    self.decoder_cross_before = model_opt.decoder_cross_before
+    # self.decoder_cross_before = model_opt.decoder_cross_before
     self.only_fixed = model_opt.only_fixed
-    self.gated_auto_src = model_opt.gated_auto_src
+    # self.gated_auto_src = model_opt.gated_auto_src
     self.share_dec_cross_attn = model_opt.share_dec_cross_attn
     self.doc_ctx_start = (model_opt.dec_layers - model_opt.doc_context_layers) <= layer_idx
     
@@ -209,9 +209,11 @@ class TransformerDecoder(nn.Module):
             _recursive_map(v)
           else:
             struct[k] = fn(v, batch_dim)
-
-    self.state["src"] = fn(self.state["src"], 1)
-    self.state["src_enc"] = fn(self.state["src_enc"], 1)
+    if self.state["src"] is not None:
+      self.state["src"] = fn(self.state["src"], 1)
+    
+    if self.state["src_enc"] is not None:
+      self.state["src_enc"] = fn(self.state["src_enc"], 1)
     
     if self.state["src_mask"] is not None:
       self.state["src_mask"] = fn(self.state["src_mask"], 0)
