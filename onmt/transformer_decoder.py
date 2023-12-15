@@ -43,8 +43,8 @@ class TransformerDecoderLayer(nn.Module):
     self.dropout = dropout
     self.drop = nn.Dropout(dropout)
 
-    if self.gated_auto_src and self.doc_ctx_start:
-      self.gate_module = onmt.sublayer.GateController(d_model)
+    # if self.gated_auto_src and self.doc_ctx_start:
+    #   self.gate_module = onmt.sublayer.GateController(d_model)
     
     mask = self._get_attn_subsequent_mask(MAX_SIZE)
     # Register self.mask as a buffer in TransformerDecoderLayer, so
