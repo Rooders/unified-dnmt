@@ -139,7 +139,7 @@ class NMTModel(nn.Module):
       _, memory_bank, src_mask, trans_out, trans_mask= self.encoder_forward(task_type="unified_enc", \
                                       lengths=src_lengths, src=src, tgt_tran=tgt_tran)
       
-      self.decoder.init_state(auto_trans_out=trans_out, tgt_tran_mask=trans_mask)
+      self.decoder.init_state(auto_trans_bank=trans_out, tgt_tran_mask=trans_mask)
       repair_dec_out, attns, z = self.decoder(tgt[:-1], sent_num=src_lengths.size(-1))
       
       self.decoder.init_state(src, memory_bank, src_mask)
