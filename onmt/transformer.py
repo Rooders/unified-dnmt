@@ -123,8 +123,8 @@ class NMTModel(nn.Module):
     # _, memory_bank, enc_mask = self.encoder(src, src_lengths)
     
     # multi_task training mode
-    if self.multi_task_training:
-      return self.multitask_pass(src, tgt, tgt_tran, src_lengths)
+    # if self.multi_task_training:
+    #   return self.multitask_pass(src, tgt, tgt_tran, src_lengths)
     
 
     # app_dis_loss = 0.0
