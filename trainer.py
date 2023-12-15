@@ -51,11 +51,12 @@ def build_trainer(opt, device_id, model, fields,
     n_gpu = 0
   gpu_verbose_level = opt.gpu_verbose_level
 
-  report_manager = build_report_manager(opt)
+  trans_report_manager = build_report_manager(opt, opt.tensorboard_log_dir)
+  repair_report_manager = build_report_manager(opt, opt.repair_tensorboard_log_dir)
   trainer = Trainer(model, train_loss, valid_loss, optim, trunc_size,
                          shard_size, norm_method,
                          grad_accum_count, n_gpu, gpu_rank,
-                         gpu_verbose_level, report_manager,
+                         gpu_verbose_level, trans_report_manager, repair_report_manager,
                          model_saver=model_saver, use_auto_trans=use_auto_trans, adaptive_training_step=adaptive_training_step)
   return trainer
 
@@ -87,7 +88,7 @@ class Trainer(object):
   def __init__(self, model, train_loss, valid_loss, optim,
                trunc_size=0, shard_size=32,
                norm_method="sents", grad_accum_count=1, n_gpu=1, gpu_rank=1,
-               gpu_verbose_level=0, report_manager=None, model_saver=None, use_auto_trans=0, adaptive_training_step=0):
+               gpu_verbose_level=0, report_manager=None, repair_report_manager=None,model_saver=None, use_auto_trans=0, adaptive_training_step=0):
     # Basic attributes.
     self.model = model
     self.train_loss = train_loss
@@ -100,7 +101,8 @@ class Trainer(object):
     self.n_gpu = n_gpu
     self.gpu_rank = gpu_rank
     self.gpu_verbose_level = gpu_verbose_level
-    self.report_manager = report_manager
+    self.trans_report_manager = report_manager
+    self.repair_report_manager = repair_report_manager
     self.model_saver = model_saver
     self.use_auto_trans = use_auto_trans
     self.adaptive_training_step = adaptive_training_step
@@ -143,8 +145,9 @@ class Trainer(object):
     report_stats = Statistics()
     fixed_trans_total_stats = Statistics()
     fixed_trans_report_stats = Statistics()
-    self._start_report_manager(start_time=total_stats.start_time)
-
+    self._start_report_manager(start_time=total_stats.start_time, task="trans")
+    self._start_report_manager(start_time=fixed_trans_total_stats.start_time, task="repair")
+    
     while step <= train_steps:
       reduce_counter = 0
       start_adpative_training = False
@@ -202,7 +205,7 @@ class Trainer(object):
             fixed_trans_report_stats = self._maybe_report_training(
               step, train_steps,
               self.optim.learning_rate,
-              fixed_trans_report_stats)
+              fixed_trans_report_stats, task="repair")
 
             true_batchs = []
             accum = 0
@@ -224,7 +227,7 @@ class Trainer(object):
               self._report_step(self.optim.learning_rate,
                                 step, valid_stats=valid_stats)
               self._report_step(self.optim.learning_rate,
-                                step, valid_stats=fixed_stats)
+                                step, valid_stats=fixed_stats, task="repair")
 
             if self.gpu_rank == 0:
               self._maybe_save(step)
@@ -376,15 +379,16 @@ class Trainer(object):
                   grads, float(1))
           self.optim.step()
 
-  def _start_report_manager(self, start_time=None):
+  def _start_report_manager(self, start_time=None, task="trans"):
       """
       Simple function to start report manager (if any)
       """
-      if self.report_manager is not None:
+      report_manager = self.trans_report_manager if task == "trans" else self.repair_report_manager
+      if report_manager is not None:
           if start_time is None:
-              self.report_manager.start()
+              report_manager.start()
           else:
-              self.report_manager.start_time = start_time
+              report_manager.start_time = start_time
 
   def _maybe_gather_stats(self, stat):
       """
@@ -402,24 +406,27 @@ class Trainer(object):
       return stat
 
   def _maybe_report_training(self, step, num_steps, learning_rate,
-                             report_stats):
+                             report_stats, task="trans"):
       """
       Simple function to report training stats (if report_manager is set)
       see `onmt.utils.ReportManagerBase.report_training` for doc
       """
-      if self.report_manager is not None:
-          return self.report_manager.report_training(
+      report_manager = self.trans_report_manager if task == "trans" else self.repair_report_manager
+      if report_manager is not None:
+          return report_manager.report_training(
               step, num_steps, learning_rate, report_stats,
               multigpu=self.n_gpu > 1)
 
   def _report_step(self, learning_rate, step, train_stats=None,
-                   valid_stats=None):
+                   valid_stats=None, task="trans"):
       """
       Simple function to report stats (if report_manager is set)
       see `onmt.utils.ReportManagerBase.report_step` for doc
       """
-      if self.report_manager is not None:
-          return self.report_manager.report_step(
+      report_manager = self.trans_report_manager if task == "trans" else self.repair_report_manager
+      
+      if report_manager is not None:
+          return report_manager.report_step(
               learning_rate, step, train_stats=train_stats,
               valid_stats=valid_stats)
 

@@ -99,21 +99,21 @@ class TransformerDecoderLayer(nn.Module):
     z = 0.0
     
     if step is None:
-      if src_cls_hidden is not None:
-        tgt_pad_mask = torch.cat((src_cls_mask, tgt_pad_mask), 2)
-        inputs = torch.cat((src_cls_hidden.unsqueeze(1), inputs), 1)
-      if auto_cls_hidden is not None:
-        tgt_pad_mask = torch.cat((auto_cls_mask, tgt_pad_mask), 2) # [sent_num, 1, seq_len + 2]
-        inputs = torch.cat((auto_cls_hidden.unsqueeze(1), inputs), 1)
+      # if src_cls_hidden is not None:
+      #   tgt_pad_mask = torch.cat((src_cls_mask, tgt_pad_mask), 2)
+      #   inputs = torch.cat((src_cls_hidden.unsqueeze(1), inputs), 1)
+      # if auto_cls_hidden is not None:
+      #   tgt_pad_mask = torch.cat((auto_cls_mask, tgt_pad_mask), 2) # [sent_num, 1, seq_len + 2]
+      #   inputs = torch.cat((auto_cls_hidden.unsqueeze(1), inputs), 1)
       
       dec_mask = torch.gt(tgt_pad_mask +
                           self.mask[:, :tgt_pad_mask.size(-1),
                                     :tgt_pad_mask.size(-1)], 0) # [sent_num, 1, seq_len]
-    if step == 0:
-      if src_cls_hidden is not None:
-        inputs = torch.cat((src_cls_hidden.unsqueeze(1), inputs), 1)
-      if auto_cls_hidden is not None:
-        inputs = torch.cat((auto_cls_hidden.unsqueeze(1), inputs), 1)
+    # if step == 0:
+    #   if src_cls_hidden is not None:
+    #     inputs = torch.cat((src_cls_hidden.unsqueeze(1), inputs), 1)
+    #   if auto_cls_hidden is not None:
+    #     inputs = torch.cat((auto_cls_hidden.unsqueeze(1), inputs), 1)
       
       
     if self.share_dec_cross_attn:
@@ -132,26 +132,26 @@ class TransformerDecoderLayer(nn.Module):
     if memory_bank is None and auto_trans_bank is not None:
       mid, attn = do_cross_attn(auto_trans_bank, query, auto_trans_mask, attn_type=auto_cross,inner_type="auto_context")
     
-    if self.gated_auto_src:
+    # if self.gated_auto_src:
       
-      assert(self.only_fixed == 0 or auto_trans_bank is not None or self.use_auto_trans == 1)
-      if self.doc_ctx_start:
-        src_cross_o, attn = do_cross_attn(memory_bank, query, src_pad_mask, attn_type=src_cross, return_resnet=False)
-        auto_cross_o, attn = do_cross_attn(auto_trans_bank, query, auto_trans_mask, attn_type=auto_cross,inner_type="auto_context", return_resnet=False)
-        mid, z = self.gate_module(auto_cross_o, src_cross_o, return_gate_num=True)
-        mid = self.drop(mid) + query
-      if not self.doc_ctx_start:
-        mid, attn = do_cross_attn(memory_bank, query, src_pad_mask, attn_type=src_cross)
-    # do ffnn
+    #   assert(self.only_fixed == 0 or auto_trans_bank is not None or self.use_auto_trans == 1)
+    #   if self.doc_ctx_start:
+    #     src_cross_o, attn = do_cross_attn(memory_bank, query, src_pad_mask, attn_type=src_cross, return_resnet=False)
+    #     auto_cross_o, attn = do_cross_attn(auto_trans_bank, query, auto_trans_mask, attn_type=auto_cross,inner_type="auto_context", return_resnet=False)
+    #     mid, z = self.gate_module(auto_cross_o, src_cross_o, return_gate_num=True)
+    #     mid = self.drop(mid) + query
+    #   if not self.doc_ctx_start:
+    #     mid, attn = do_cross_attn(memory_bank, query, src_pad_mask, attn_type=src_cross)
+    # # do ffnn
     mid_norm = self.ffn_layer_norm(mid)
     output = self.feed_forward(mid_norm)
     output = self.drop(output) + mid
     
-    if step is None or step == 0:
-      if auto_cls_hidden is not None:
-        output = output[:, 1:, :]
-      if src_cls_hidden is not None:
-        output = output[:, 1:, :]
+    # if step is None or step == 0:
+    #   if auto_cls_hidden is not None:
+    #     output = output[:, 1:, :]
+    #   if src_cls_hidden is not None:
+    #     output = output[:, 1:, :]
 
     return output, attn, z
 

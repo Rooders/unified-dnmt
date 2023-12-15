@@ -9,10 +9,10 @@ from utils.logging import logger
 from utils.statistics import Statistics
 
 
-def build_report_manager(opt):
+def build_report_manager(opt, dir):
     if opt.tensorboard:
         from tensorboardX import SummaryWriter
-        tensorboard_log_dir = opt.tensorboard_log_dir
+        tensorboard_log_dir = dir
 
         if not opt.train_from:
             tensorboard_log_dir += datetime.now().strftime("/%b-%d_%H-%M-%S")

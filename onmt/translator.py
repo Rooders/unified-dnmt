@@ -36,6 +36,7 @@ class Translator(object):
     self.min_length = opt.min_length
     self.pre_paired_trans = opt.pre_paired_trans
     self.minimal_relative_prob = opt.minimal_relative_prob
+    self.inference_mode = opt.inference_mode
     self.out_file = out_file
     self.tgt_eos_id = fields["tgt"].vocab.stoi[Constants.EOS_WORD]
     self.tgt_bos_id = fields["tgt"].vocab.stoi[Constants.BOS_WORD]
@@ -50,10 +51,12 @@ class Translator(object):
     self.cross_before = model_opt.cross_before
     self.decoder_cross_before = model_opt.decoder_cross_before
     self.only_fixed = model_opt.only_fixed
-    self.src_mlm = model_opt.src_mlm
-    self.auto_truth_trans_kl = model_opt.auto_truth_trans_kl
-    print(self.auto_truth_trans_kl)
-    print(self.src_mlm)
+    
+    print(self.inference_mode)
+    # self.src_mlm = model_opt.src_mlm
+    # self.auto_truth_trans_kl = model_opt.auto_truth_trans_kl
+    # # print(self.auto_truth_trans_kl)
+    # print(self.src_mlm)
     # self.shift_num = model_opt.shift_num
     # print(self.shift_num)
   
@@ -297,10 +300,10 @@ class Translator(object):
         tgt_seg_emb = None
       # src_emb, src_enc, src_mask = self.model.encoder(src_seq, batch.src[-1])
       
-      auto_cls_hidden = None
-      src_cls_hidden = None
-      auto_avg_hidden = None
-      src_avg_hidden = None
+      # auto_cls_hidden = None
+      # src_cls_hidden = None
+      # auto_avg_hidden = None
+      # src_avg_hidden = None
       tgt_tran_mask = None
       enc_mask = None
       memory_bank = None
@@ -312,13 +315,13 @@ class Translator(object):
         if not self.only_fixed:
           _, memory_bank, enc_mask, auto_trans_out, tgt_tran_mask = self.model.encoder_forward(task_type="unified_enc", \
                                       lengths=src_lengths, src=src_seq, tgt_tran=tgt_tran)
-          if self.auto_truth_trans_kl:
-            auto_avg_hidden, _ = self.model.avg_pooling_with_mask(auto_trans_out.transpose(0, 1), tgt_tran_mask)
-            auto_cls_hidden = self.model.transfer_layer(auto_avg_hidden) # [doc_, dim]
+          # if self.auto_truth_trans_kl:
+          #   auto_avg_hidden, _ = self.model.avg_pooling_with_mask(auto_trans_out.transpose(0, 1), tgt_tran_mask)
+          #   auto_cls_hidden = self.model.transfer_layer(auto_avg_hidden) # [doc_, dim]
             
-            if self.src_mlm:
-              src_avg_hidden, _ = self.model.avg_pooling_with_mask(memory_bank.transpose(0, 1), enc_mask)
-              src_cls_hidden = self.model.transfer_layer(src_avg_hidden)
+          #   if self.src_mlm:
+          #     src_avg_hidden, _ = self.model.avg_pooling_with_mask(memory_bank.transpose(0, 1), enc_mask)
+          #     src_cls_hidden = self.model.transfer_layer(src_avg_hidden)
           
           
           # if self.auto_truth_trans_kl:
@@ -350,9 +353,13 @@ class Translator(object):
 
       # src_emb: (seq_len_src, batch_size, emb_size)
       # src_enc: (seq_len_src, batch_size, hid_size)
-      self.model.decoder.init_state(src_seq, memory_bank, enc_mask, segment_embeding=tgt_seg_emb, \
-                                    auto_trans_bank=auto_trans_out, auto_trans_mask=tgt_tran_mask, 
-                                    src_cls_hidden=src_avg_hidden, auto_cls_hidden=auto_avg_hidden)
+      
+      if self.inference_mode == "trans":
+        self.model.decoder.init_state(src_seq, memory_bank, enc_mask, segment_embeding=tgt_seg_emb)
+      
+      if self.inference_mode == "repair":
+        self.model.decoder.init_state(segment_embeding=tgt_seg_emb, \
+                                    auto_trans_bank=auto_trans_out, auto_trans_mask=tgt_tran_mask)
       # self.model.decoder.init_state(src_seq, memory_bank, enc_mask, segment_embeding=tgt_seg_emb)
       src_len = src_seq.size(0)
       
