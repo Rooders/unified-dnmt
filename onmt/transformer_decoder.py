@@ -245,7 +245,8 @@ class TransformerDecoder(nn.Module):
       _recursive_map(self.state["cache"])
     
   def detach_state(self):
-    self.state["src"] = self.state["src"].detach()
+    if self.state["src"] is not None:
+      self.state["src"] = self.state["src"].detach()
 
   def forward(self, tgt, step=None, sent_num=None, beam_size=None):
     """
