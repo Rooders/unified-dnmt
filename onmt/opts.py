@@ -41,6 +41,7 @@ def model_opts(parser):
                        Necessary for non-RNN style models.
                        """)
     
+
     group.add('--segment_embedding', '-segment_embedding', type=int, default=0,
               help="""Use a embeding to mark relative sentences positions.
                        """)
@@ -247,18 +248,20 @@ def train_opts(parser):
     group.add('--connect_with_gate', '-connect_with_gate', type=int, default=0,
             help="approach to the truth translation")
     
-    group.add('--auto_truth_trans_kl', '-auto_truth_trans_kl', type=int, default=0,
+    
+    
+    group.add('--base_b', '-base_b', type=float, default=0.7,
             help="approach to the truth translation")
-    group.add('--weight_trans_kl', '-weight_trans_kl', type=float, default=1.0,
+    
+    group.add('--add_s', '-add_s', type=float, default=0.05,
             help="approach to the truth translation")
-    group.add('--use_src_app', '-use_src_app', type=int, default=0,
+    
+    group.add('--cross_task_reg', '-cross_task_reg', type=int, default=0,
             help="approach to the truth translation")
-    group.add('--use_tgt_app', '-use_tgt_app', type=int, default=0,
+    
+    group.add('--adaptive_training_step', '-adaptive_training_step', type=int, default=0,
             help="approach to the truth translation")
-    group.add('--src_app_avg', '-src_app_avg', type=int, default=0,
-            help="approach to the truth translation")
-    group.add('--use_z_contronl', '-use_z_contronl', type=int, default=0,
-            help="approach to the truth translation")
+    
     group.add('--fixed_trans', '-fixed_trans', type=int, default=0,
             help="use the automatic translation to improve the performance of transltion")
     

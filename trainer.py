@@ -42,6 +42,8 @@ def build_trainer(opt, device_id, model, fields,
   grad_accum_count = opt.accum_count
   use_auto_trans = opt.use_auto_trans
   n_gpu = opt.world_size
+  
+  adaptive_training_step = opt.adaptive_training_step
   if device_id >= 0:
     gpu_rank = opt.gpu_ranks[device_id]
   else:
@@ -54,7 +56,7 @@ def build_trainer(opt, device_id, model, fields,
                          shard_size, norm_method,
                          grad_accum_count, n_gpu, gpu_rank,
                          gpu_verbose_level, report_manager,
-                         model_saver=model_saver, use_auto_trans=use_auto_trans)
+                         model_saver=model_saver, use_auto_trans=use_auto_trans, adaptive_training_step=adaptive_training_step)
   return trainer
 
 
@@ -85,7 +87,7 @@ class Trainer(object):
   def __init__(self, model, train_loss, valid_loss, optim,
                trunc_size=0, shard_size=32,
                norm_method="sents", grad_accum_count=1, n_gpu=1, gpu_rank=1,
-               gpu_verbose_level=0, report_manager=None, model_saver=None, use_auto_trans=0):
+               gpu_verbose_level=0, report_manager=None, model_saver=None, use_auto_trans=0, adaptive_training_step=0):
     # Basic attributes.
     self.model = model
     self.train_loss = train_loss
@@ -101,6 +103,7 @@ class Trainer(object):
     self.report_manager = report_manager
     self.model_saver = model_saver
     self.use_auto_trans = use_auto_trans
+    self.adaptive_training_step = adaptive_training_step
     
     assert grad_accum_count > 0
     if grad_accum_count > 1:
@@ -144,6 +147,7 @@ class Trainer(object):
 
     while step <= train_steps:
       reduce_counter = 0
+      start_adpative_training = False
       for i, batch in enumerate(train_iter):
 
         # if batch is document-level, need to reshape shape of data
@@ -181,20 +185,24 @@ class Trainer(object):
             if self.n_gpu > 1:
               normalization = sum(all_gather_list
                                     (normalization))
+            
 
+            if step > self.adaptive_training_step and self.adaptive_training_step > 0:
+              start_adpative_training = True
+            
             self._gradient_accumulation(
               true_batchs, normalization, total_stats,
-              report_stats, fixed_trans_total_stats, fixed_trans_report_stats)
+              report_stats, fixed_trans_total_stats, fixed_trans_report_stats, start_adpative_training)
 
             report_stats = self._maybe_report_training(
               step, train_steps,
               self.optim.learning_rate,
               report_stats)
             
-            # fixed_trans_report_stats = self._maybe_report_training(
-            #   step, train_steps,
-            #   self.optim.learning_rate,
-            #   fixed_trans_report_stats)
+            fixed_trans_report_stats = self._maybe_report_training(
+              step, train_steps,
+              self.optim.learning_rate,
+              fixed_trans_report_stats)
 
             true_batchs = []
             accum = 0
@@ -209,14 +217,14 @@ class Trainer(object):
                 logger.info('GpuRank %d: gather valid stat \
                               step %d' % (self.gpu_rank, step))
               valid_stats = self._maybe_gather_stats(valid_stats)
-              # fixed_stats = self._maybe_gather_stats(fixed_stats)
+              fixed_stats = self._maybe_gather_stats(fixed_stats)
               if self.gpu_verbose_level > 0:
                 logger.info('GpuRank %d: report stat step %d'
                               % (self.gpu_rank, step))
               self._report_step(self.optim.learning_rate,
                                 step, valid_stats=valid_stats)
-              # self._report_step(self.optim.learning_rate,
-              #                   step, valid_stats=fixed_stats)
+              self._report_step(self.optim.learning_rate,
+                                step, valid_stats=fixed_stats)
 
             if self.gpu_rank == 0:
               self._maybe_save(step)
@@ -265,16 +273,17 @@ class Trainer(object):
         tgt_tran = None
       # F-prop through the model.
       with torch.no_grad():
-        outputs, attns, src_cls_hidden, auto_cls_hidden, enc_loss = self.model(src, tgt, tgt_tran, src_lengths)
+        outputs = self.model(src, tgt, tgt_tran, src_lengths)
 
       # Compute loss.
         batch_stats, fixed_batch_stats = self.valid_loss.monolithic_compute_loss(
-          batch, outputs, attns, src_cls_hidden, auto_cls_hidden, enc_loss)
+          batch, outputs)
 
       # Update statistics.
       stats.update(batch_stats)
-      # if fixed_stats is not None:
-      #   fixed_stats.update(fixed_batch_stats)
+      
+      if fixed_stats is not None:
+        fixed_stats.update(fixed_batch_stats)
 
     # Set model back to training mode.
     self.model.train()
@@ -282,7 +291,7 @@ class Trainer(object):
     return stats, fixed_stats
 
   def _gradient_accumulation(self, true_batchs, normalization, total_stats,
-                             report_stats, fixed_total_stats, fixed_report_stats):
+                             report_stats, fixed_total_stats, fixed_report_stats, start_adaptive_training=False):
       if self.grad_accum_count > 1:
           self.model.zero_grad()
       for batch in true_batchs:
@@ -313,10 +322,10 @@ class Trainer(object):
               
               if self.optim.mixed_precision:
                 with torch.cuda.amp.autocast():
-                  outputs, attns, src_cls_hidden, auto_cls_hidden, enc_loss = \
+                  outputs = \
                       self.model(src, tgt, tgt_tran, src_lengths)
               else:
-                outputs, attns, src_cls_hidden, auto_cls_hidden, enc_loss = \
+                outputs = \
                       self.model(src, tgt, tgt_tran, src_lengths)
               # outputs, attns = \
               #     self.model(src, tgt, src_lengths)
@@ -324,15 +333,16 @@ class Trainer(object):
               if self.optim.mixed_precision:
                 with torch.cuda.amp.autocast():
                   batch_stats, fixed_stats = self.train_loss.sharded_compute_loss(
-                      batch, outputs, attns, j,
-                      trunc_size, self.shard_size, normalization, self.optim.scaler, src_cls_hidden, auto_cls_hidden, enc_loss, self.grad_accum_count * self.n_gpu)
+                      batch, outputs, j,
+                      trunc_size, self.shard_size, normalization, self.optim.scaler, self.grad_accum_count * self.n_gpu, start_adaptive_training)
               else:
                 batch_stats, fixed_stats = self.train_loss.sharded_compute_loss(
-                      batch, outputs, attns, j,
-                      trunc_size, self.shard_size, normalization, None, src_cls_hidden, auto_cls_hidden, enc_loss, self.grad_accum_count * self.n_gpu)
+                      batch, outputs, j,
+                      trunc_size, self.shard_size, normalization, None, self.grad_accum_count * self.n_gpu, start_adaptive_training)
               
               total_stats.update(batch_stats)
               report_stats.update(batch_stats)
+              
               if fixed_stats is not None:
                 fixed_total_stats.update(fixed_stats)
                 fixed_report_stats.update(fixed_stats)

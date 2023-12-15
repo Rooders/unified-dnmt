@@ -35,7 +35,7 @@ class Projector(nn.Module):
           dropout (float): dropout probability(0-1.0).
   """
 
-  def __init__(self, d_model, dropout=0.1, hidden_layers_num=1):
+  def __init__(self, d_model, dropout=0.1, hidden_layers_num=0):
     super(Projector, self).__init__()
     hidden_size = 2 * d_model
     self.dropout = nn.Dropout(dropout)

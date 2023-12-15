@@ -127,9 +127,9 @@ class NMTModel(nn.Module):
       return self.multitask_pass(src, tgt, tgt_tran, src_lengths)
     
 
-    app_dis_loss = 0.0
-    auto_cls_hidden = None
-    src_cls_hidden = None
+    # app_dis_loss = 0.0
+    # auto_cls_hidden = None
+    # src_cls_hidden = None
     # encoder pass for making auto translaiton approach the truth translsation. / unified only
     if self.cross_attn:
       # tgt_enc = tgt.clone()
@@ -138,21 +138,32 @@ class NMTModel(nn.Module):
       #                                 lengths=src_lengths, tgt_tran=tgt_enc)
       _, memory_bank, src_mask, trans_out, trans_mask= self.encoder_forward(task_type="unified_enc", \
                                       lengths=src_lengths, src=src, tgt_tran=tgt_tran)
-      if self.auto_truth_trans_kl:
-        auto_avg_hidden, _ = self.avg_pooling_with_mask(trans_out.transpose(0, 1), trans_mask)
-        auto_cls_hidden = self.transfer_layer(auto_avg_hidden) # [doc_, dim]
-        if self.src_mlm:
-          src_avg_hidden, _ = self.avg_pooling_with_mask(memory_bank.transpose(0, 1), src_mask)
-          src_cls_hidden = self.transfer_layer(src_avg_hidden)
+      
+      self.decoder.init_state(auto_trans_out=trans_out, tgt_tran_mask=trans_mask)
+      repair_dec_out, attns, z = self.decoder(tgt[:-1], sent_num=src_lengths.size(-1))
+      
+      self.decoder.init_state(src, memory_bank, src_mask)
+      trans_dec_out, attns, z = self.decoder(tgt[:-1], sent_num=src_lengths.size(-1))
+
+      return {"repair_out":repair_dec_out, 
+              "trans_out":trans_dec_out,
+              "attns": attns}
+
+      # if self.auto_truth_trans_kl:
+      #   auto_avg_hidden, _ = self.avg_pooling_with_mask(trans_out.transpose(0, 1), trans_mask)
+      #   auto_cls_hidden = self.transfer_layer(auto_avg_hidden) # [doc_, dim]
+      #   if self.src_mlm:
+      #     src_avg_hidden, _ = self.avg_pooling_with_mask(memory_bank.transpose(0, 1), src_mask)
+      #     src_cls_hidden = self.transfer_layer(src_avg_hidden)
       # trans_avg_out, loss_mask = self.avg_pooling_with_mask(trans_out.transpose(0, 1), trans_mask)
       # truth_avg_out, _ = self.avg_pooling_with_mask(truth_out.transpose(0, 1), truth_mask)
       # app_dis_loss = self.auto_truth_dis_loss(trans_avg_out, truth_avg_out.detach(), self.distance_fc)
       # app_dis_loss = (app_dis_loss * (1 - loss_mask.float())).sum() / (1 - loss_mask.float()).sum()
-      self.decoder.init_state(src, memory_bank, src_mask, 
-                              auto_trans_bank=trans_out, 
-                              auto_trans_mask=trans_mask,
-                              src_cls_hidden=src_avg_hidden,
-                              auto_cls_hidden=auto_avg_hidden)
+      # self.decoder.init_state(src, memory_bank, src_mask, 
+      #                         auto_trans_bank=trans_out, 
+      #                         auto_trans_mask=trans_mask,
+      #                         src_cls_hidden=src_avg_hidden,
+      #                         auto_cls_hidden=auto_avg_hidden)
                               
     # encoder pass for DocRepair
     if self.only_fixed:
@@ -160,22 +171,30 @@ class NMTModel(nn.Module):
       _, _, _, trans_out, trans_mask = self.encoder_forward(task_type="tgt_enc", \
                            lengths=src_lengths, tgt_tran=tgt_tran)
       self.decoder.init_state(auto_trans_out=trans_out, tgt_tran_mask=trans_mask)
+      dec_out, attns, z = self.decoder(tgt[:-1], sent_num=src_lengths.size(-1))
+      return {"repair_out":dec_out, 
+              "trans_out":None,
+              "attns": attns}
     # encoder pass for SentTrans or DocTrans
+    
     if self.only_trans:
       _, memory_bank, src_mask, _, _ = self.encoder_forward(task_type="src_enc", \
                            lengths=src_lengths, src=src)
       self.decoder.init_state(src, memory_bank, src_mask)
-    
+      dec_out, attns, z = self.decoder(tgt[:-1], sent_num=src_lengths.size(-1))
+      return {"repair_out":None, 
+              "trans_out":dec_out,
+              "attns": attns}
 
     # decoder pass
-    dec_out, attns, z = self.decoder(tgt[:-1], sent_num=src_lengths.size(-1))
+    # dec_out, attns, z = self.decoder(tgt[:-1], sent_num=src_lengths.size(-1))
     # approching loss scale use value of gating 
     # if self.use_z_contronl:
     #   app_dis_loss = z * app_dis_loss * self.weight_trans_kl 
     # else:
     #   app_dis_loss = app_dis_loss * self.weight_trans_kl
 
-    return dec_out, attns, src_cls_hidden, auto_cls_hidden, z
+    # return dec_out, attns, src_cls_hidden, auto_cls_hidden, z
 
 
 def build_embeddings(opt, word_dict, for_encoder=True):

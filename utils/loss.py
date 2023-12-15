@@ -27,24 +27,14 @@ def build_loss_compute(model, tgt_vocab, src_vocab, opt, train=True):
   device = torch.device("cuda" if use_gpu(opt) else "cpu")
 
   padding_idx = tgt_vocab.stoi[Constants.PAD_WORD]
-  src_padding_idx = src_vocab.stoi[Constants.PAD_WORD]
+  
   if opt.label_smoothing > 0:
     criterion = LabelSmoothingLoss(
       opt.label_smoothing, len(tgt_vocab), ignore_index=padding_idx
     )
-    if not opt.share_embeddings:
-      src_criterion = LabelSmoothingLoss(
-        opt.label_smoothing, len(src_vocab), ignore_index=src_padding_idx
-      )
-    else:
-      src_criterion = criterion
-
   else:
     criterion = nn.NLLLoss(ignore_index=padding_idx, reduction='sum')
-    if not opt.share_embeddings:
-      src_criterion = nn.NLLLoss(ignore_index=src_padding_idx, reduction='sum')
-    else:
-      src_criterion = criterion
+  
 
 
   # if the loss function operates on vectors of raw logits instead of
@@ -52,8 +42,8 @@ def build_loss_compute(model, tgt_vocab, src_vocab, opt, train=True):
   # passed to the NMTLossCompute. At the moment, the only supported
   # loss function of this kind is the sparsemax loss.
   loss_gen = model.generator
-  src_gen = model.src_generator
-  compute = NMTLossCompute(criterion, loss_gen, src_criterion, src_gen, opt.weight_trans_kl, opt.use_z_contronl)
+  compute = NMTLossCompute(criterion, loss_gen, opt.base_b, opt.add_s, opt.adaptive_training, opt.cross_task_reg)
+  
   compute.to(device)
 
   return compute
@@ -78,14 +68,14 @@ class LossComputeBase(nn.Module):
         normalzation (str): normalize by "sents" or "tokens"
     """
 
-    def __init__(self, criterion, generator, src_criterion, src_generator, enc_loss_w=1.0, use_z_contronl=False):
+    def __init__(self, criterion, generator, base_b, add_s, adaptive_training=False, cross_task_reg=False):
         super(LossComputeBase, self).__init__()
         self.criterion = criterion
         self.generator = generator
-        self.src_criterion = src_criterion
-        self.src_generator = src_generator
-        self.weight_trans_kl = enc_loss_w
-        self.use_z_contronl = use_z_contronl
+        self.base_b = base_b
+        self.add_s = add_s
+        self.adaptive_training = adaptive_training
+        self.cross_task_reg = cross_task_reg
 
     @property
     def padding_idx(self):
@@ -121,7 +111,7 @@ class LossComputeBase(nn.Module):
         """
         return NotImplementedError
 
-    def monolithic_compute_loss(self, batch, output, attns, src_cls_hid=None, auto_cls_hid=None, enc_loss=0, accum_norm=1.0):
+    def monolithic_compute_loss(self, batch, output, accum_norm=1.0):
         """
         Compute the forward loss for the batch.
 
@@ -135,31 +125,23 @@ class LossComputeBase(nn.Module):
         Returns:
             :obj:`onmt.utils.Statistics`: loss statistics
         """
-        range_ = (0, batch.tgt.size(0))
-        shard_state = self._make_shard_state(batch, output, range_, attns)
-        _, batch_stats = self._compute_loss(batch, **shard_state)
+        repair_batch_stats, trans_batch_stats = None, None
         
+        if output["repair_out"] is not None:
+          range_ = (0, batch.tgt.size(0))
+          shard_state = self._make_shard_state(batch, output["repair_out"], range_, output["attns"])
+          _, repair_batch_stats, _ = self._compute_loss(batch, **shard_state)
         
-
-        if src_cls_hid is not None:
-          src_cls_loss = self._compute_cls_loss(batch, src_cls_hid, batch.tgt[1:], gen_type="tgt")
-        else:
-          src_cls_loss = 0.0
+        if output["trans_out"] is not None:
+          range_ = (0, batch.tgt.size(0))
+          shard_state = self._make_shard_state(batch, output["trans_out"], range_, output["attns"])
+          _, trans_batch_stats, _ = self._compute_loss(batch, **shard_state)
         
-        if auto_cls_hid is not None:
-          auto_cls_loss = self._compute_cls_loss(batch, auto_cls_hid, batch.tgt[1:], gen_type="tgt")
-        else:
-          auto_cls_loss = 0.0
-        
-        enc_loss = src_cls_loss + auto_cls_loss
-        if enc_loss > 0:
-          batch_stats.add_enc_loss(enc_loss.clone().item())
-
-        return batch_stats, None
-
-    def sharded_compute_loss(self, batch, output, attns,
+        return repair_batch_stats, trans_batch_stats
+    
+    def sharded_compute_loss(self, batch, output, 
                              cur_trunc, trunc_size, shard_size,
-                             normalization, scaler=None, src_cls_hid=None, auto_cls_hid=None, enc_loss=1.0, accum_norm=1.0):
+                             normalization, scaler=None, accum_norm=1.0, start_adaptive_training=False):
         """Compute the forward loss and backpropagate.  Computation is done
         with shards and optionally truncation for memory efficiency.
 
@@ -187,50 +169,73 @@ class LossComputeBase(nn.Module):
             :obj:`onmt.utils.Statistics`: validation loss statistics
 
         """
-        batch_stats = Statistics()
-        # range_ = (cur_trunc, cur_trunc + trunc_size)
+        trans = False
+        repair = False
+        
+        if output["repair_out"] is not None:
+          repair = True
+        
+        if output["trans_out"] is not None:
+          trans = True
 
-        # shard_state = self._make_shard_state(batch, output, range_, attns)
-        # for shard in shards(shard_state, shard_size):
-        #     loss, stats = self._compute_loss(batch, **shard)
-        #     loss.div(float(normalization)).backward()
-        #     batch_stats.update(stats)
+        repair_batch_stats = Statistics()
+        trans_batch_stats = Statistics()
+        repair_loss = 0.0
+        trans_loss = 0.0
+        w = 1.0
+        repair_scores = [1.0]
+        trans_scores = [1.0]
+       
         non_pad_mask = batch.tgt[1:] != self.criterion.ignore_index # [seq_len, batch]
         non_pad_idx = non_pad_mask.float().contiguous().view(-1).nonzero().squeeze(1) # [bs, 1]
-        sent_non_pad_idx = non_pad_mask.transpose(0, 1).float().sum(1).contiguous().nonzero().squeeze(1) #[sent_num]
-        loss, stats = self._compute_loss(batch, output, batch.tgt[1:], select_mask=non_pad_idx)
-        # loss, stats = self._compute_loss(batch, output, batch.tgt[1:])
-        loss = loss.div(float(normalization))
         
-
-        # src cls loss
-        if src_cls_hid is not None:
-          src_cls_loss = self._compute_cls_loss(batch, src_cls_hid, batch.tgt[1:], gen_type='tgt', select_mask=sent_non_pad_idx)
-          src_cls_loss = src_cls_loss.div(float(normalization))
-        else:
-          src_cls_loss = 0.0
-        # auto cls loss
-        if auto_cls_hid is not None:
-          auto_cls_loss = self._compute_cls_loss(batch, auto_cls_hid, batch.tgt[1:], gen_type='tgt', select_mask=sent_non_pad_idx)
-          auto_cls_loss = auto_cls_loss.div(float(normalization))
-        else:
-          auto_cls_loss = 0.0 
+        if start_adaptive_training:
+          # [bs, tgt_len]
+          repair_o = self._bottle(output["repair_out"])[non_pad_idx]
+          trans_o =  self._bottle(output["trans_out"])[non_pad_idx]
+          w = F.cosine_similarity(repair_o, trans_o) #[bs * len]
+          w = self.base_b + self.add_s * w
         
-        if self.use_z_contronl:
-          cls_loss = (src_cls_loss + auto_cls_loss) * self.weight_trans_kl * enc_loss
-        else:
-          cls_loss = (src_cls_loss + auto_cls_loss) * self.weight_trans_kl
+        loss_reduce = not start_adaptive_training
+        
+        if repair:
+          repair_loss, repair_stats, repair_scores = self._compute_loss(batch, output["repair_out"], batch.tgt[1:], select_mask=non_pad_idx, loss_reduce=loss_reduce)
+          repair_loss = repair_loss if loss_reduce else repair_loss.sum(dim=1)
+          repair_loss = (repair_loss * w).sum()
+          repair_loss = repair_loss.div(float(normalization))
+          final_loss = final_loss + repair_loss
+          
+        
+        if trans:
+          trans_loss, trans_stats, trans_scores = self._compute_loss(batch, output["trans_out"], batch.tgt[1:], select_mask=non_pad_idx, loss_reduce=loss_reduce)
+          
+          trans_loss = trans_loss if loss_reduce else trans_loss.sum(dim=1)
+          trans_loss = (trans_loss * w).sum()
+          trans_loss = trans_loss.div(float(normalization))
+          final_loss = final_loss + trans_loss
+          
 
-        if cls_loss > 0:
-          stats.add_enc_loss(cls_loss.clone().item())
-          loss = cls_loss + loss
+        if self.cross_task_reg:
+          t2r_kl = F.kl_div(trans_scores, repair_scores, reduction='sum', log_target=True)
+          r2t_kl = F.kl_div(repair_scores, trans_scores, reduction='sum', log_target=True)
+          t2r_kl = t2r_kl.div(float(normalization))
+          trans_stats.add_enc_loss(t2r_kl.clone().item())
+          r2t_kl = r2t_kl.div(float(normalization))
+          repair_stats.add_enc_loss(r2t_kl.clone().item())
+          final_loss = final_loss + (t2r_kl + r2t_kl) / 2
+        
         # use auto-mixed precision
         if scaler is not None:
-          scaler.scale(loss).backward()
+          scaler.scale(final_loss).backward()
         else:
-          loss.backward()
-        batch_stats.update(stats)
-        return batch_stats, None
+          final_loss.backward()
+        
+        if trans:
+          trans_batch_stats.update(trans_stats)
+        if repair:
+          repair_batch_stats.update(repair_stats)
+        
+        return repair_batch_stats, trans_batch_stats
 
     def _stats(self, loss, scores, target):
         """
@@ -273,24 +278,27 @@ class LabelSmoothingLoss(nn.Module):
 
     self.confidence = 1.0 - label_smoothing
 
-  def forward(self, output, target, cls_target=False):
+  def forward(self, output, target, loss_reduce=True):
     """
     output (FloatTensor): batch_size x n_classes
     target (LongTensor): batch_size or (sent_num, seq_len)
     """
-    if cls_target:
-      model_prob = self.one_hot.repeat(target.size(1), 1) # [sent_num, n_cla]
-      model_prob.scatter_(1, target.transpose(0, 1), self.confidence) # [sent_num, n_cla]
-      model_prob[:, self.ignore_index] = 0
-      mask = ((target.transpose(0, 1) != self.ignore_index).sum(1, keepdim=True)) == 0 # [sent_num, 1]
-      model_prob.masked_fill_(mask, 0)
-    else:  
-      model_prob = self.one_hot.repeat(target.size(0), 1) # [bs, n_cla]
-      model_prob.scatter_(1, target.unsqueeze(1), self.confidence)
-      model_prob.masked_fill_((target == self.ignore_index).unsqueeze(1), 0)
+    # if cls_target:
+    #   model_prob = self.one_hot.repeat(target.size(1), 1) # [sent_num, n_cla]
+    #   model_prob.scatter_(1, target.transpose(0, 1), self.confidence) # [sent_num, n_cla]
+    #   model_prob[:, self.ignore_index] = 0
+    #   mask = ((target.transpose(0, 1) != self.ignore_index).sum(1, keepdim=True)) == 0 # [sent_num, 1]
+    #   model_prob.masked_fill_(mask, 0)
+    # else:
+    reduction = "none"
+    model_prob = self.one_hot.repeat(target.size(0), 1) # [bs, n_cla]
+    model_prob.scatter_(1, target.unsqueeze(1), self.confidence)
+    model_prob.masked_fill_((target == self.ignore_index).unsqueeze(1), 0)
+   
+    if loss_reduce:
+      reduction = "sum"
     
-
-    return F.kl_div(output, model_prob, reduction='sum')
+    return F.kl_div(output, model_prob, reduction=reduction)
 
 
 class NMTLossCompute(LossComputeBase):
@@ -307,7 +315,7 @@ class NMTLossCompute(LossComputeBase):
         "target": batch.tgt[range_[0] + 1: range_[1]],
     }
 
-  def _compute_loss(self, batch, output, target, select_mask=None):
+  def _compute_loss(self, batch, output, target, select_mask=None, loss_reduce=True):
     bottled_output = self._bottle(output)
     gtruth = target.contiguous().view(-1)
     if select_mask is not None: # [non-pading token_num]
@@ -315,9 +323,10 @@ class NMTLossCompute(LossComputeBase):
       gtruth = gtruth[select_mask]
       assert(gtruth.size(0) == bottled_output.size(0))
     scores = self.generator(bottled_output)
-    loss = self.criterion(scores, gtruth)
-    stats = self._stats(loss.clone(), scores, gtruth)
-    return loss, stats
+    loss = self.criterion(scores, gtruth, loss_reduce=loss_reduce)
+    report_loss = loss.clone() if loss_reduce else loss.clone().sum()
+    stats = self._stats(report_loss, scores, gtruth)
+    return loss, stats, scores
 
   def _compute_cls_loss(self, batch, cls_hid, label, gen_type="tgt", select_mask=None):
     
