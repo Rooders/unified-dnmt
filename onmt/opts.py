@@ -514,6 +514,11 @@ def translate_opts(parser):
               help='Print scores and predictions for each sentence')
     group.add('--log_file', '-log_file', type=str, default="",
               help="Output logs to a file under this path.")
+    
+    group.add('--inference_mode', '-inference_mode', type=str, default="trans",
+              help="Output logs to a file under this path.")
+    
+
     group.add('--log_file_level', '-log_file_level', type=str,
               default="0")
     group.add('--dump_beam', '-dump_beam', type=str, default="",
