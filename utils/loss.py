@@ -305,8 +305,8 @@ class NMTLossCompute(LossComputeBase):
   Standard NMT Loss Computation.
   """
 
-  def __init__(self, criterion, generator, src_criterion, src_generator, enc_loss_w, use_z_contronl, normalization="sents"):
-    super(NMTLossCompute, self).__init__(criterion, generator, src_criterion, src_generator, enc_loss_w, use_z_contronl)
+  def __init__(self, criterion, generator, base_b, add_s, cross_task_reg=False):
+    super(NMTLossCompute, self).__init__(criterion, generator, base_b, add_s, cross_task_reg)
 
   def _make_shard_state(self, batch, output, range_, attns=None):
     return {
