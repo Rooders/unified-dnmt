@@ -29,13 +29,13 @@ class NMTModel(nn.Module):
     # self.paired_trans = model_opt.paired_trans
     self.use_auto_trans = model_opt.use_auto_trans
     self.only_fixed = model_opt.only_fixed
-    self.multi_task_training = model_opt.multi_task_training
+    # self.multi_task_training = model_opt.multi_task_training
     #Options of making auto translation appraoch truth.
-    self.auto_truth_trans_kl = model_opt.auto_truth_trans_kl
+    # self.auto_truth_trans_kl = model_opt.auto_truth_trans_kl
     self.cross_attn = model_opt.cross_attn
-    self.src_mlm = model_opt.src_mlm
-    self.weight_trans_kl = model_opt.weight_trans_kl
-    self.use_z_contronl = model_opt.use_z_contronl
+    # self.src_mlm = model_opt.src_mlm
+    # self.weight_trans_kl = model_opt.weight_trans_kl
+    # self.use_z_contronl = model_opt.use_z_contronl
     self.distance_fc = model_opt.distance_fc
     self.only_trans = False if self.only_fixed or self.cross_attn else True
     # self.shift_num = model_opt.shift_num
