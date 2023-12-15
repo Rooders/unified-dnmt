@@ -273,8 +273,8 @@ class TransformerDecoder(nn.Module):
     # print(src_memory_bank.shape) 
     src_pad_mask = self.state["src_mask"]  # [B, 1, T_src]
     auto_trans_mask = self.state["auto_trans_mask"]
-    # src_cls_mask = self.state["src_cls_mask"]  # [B, 1, T_src]
-    # auto_cls_mask = self.state["auto_cls_mask"]
+    src_cls_mask = self.state["src_cls_mask"]  # [B, 1, T_src]
+    auto_cls_mask = self.state["auto_cls_mask"]
     # Input of Decoder
     output = emb.transpose(0, 1).contiguous()
     pad_idx = self.embeddings.word_padding_idx
