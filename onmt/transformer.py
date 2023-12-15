@@ -167,7 +167,6 @@ class NMTModel(nn.Module):
                               
     # encoder pass for DocRepair
     if self.only_fixed:
-      assert(self.auto_truth_trans_kl == 0)
       _, _, _, trans_out, trans_mask = self.encoder_forward(task_type="tgt_enc", \
                            lengths=src_lengths, tgt_tran=tgt_tran)
       self.decoder.init_state(auto_trans_bank=trans_out, auto_trans_mask=trans_mask)

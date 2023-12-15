@@ -203,7 +203,6 @@ class LossComputeBase(nn.Module):
           repair_loss = repair_loss if loss_reduce else repair_loss.sum(dim=1)
           repair_loss = (repair_loss * w).sum()
           repair_loss = repair_loss.div(float(normalization))
-          print("r_l:", repair_loss)
           final_loss = final_loss + repair_loss
           
         
@@ -213,7 +212,6 @@ class LossComputeBase(nn.Module):
           trans_loss = trans_loss if loss_reduce else trans_loss.sum(dim=1)
           trans_loss = (trans_loss * w).sum()
           trans_loss = trans_loss.div(float(normalization))
-          print("t_l:", trans_loss)
           final_loss = final_loss + trans_loss
           
 
@@ -224,8 +222,6 @@ class LossComputeBase(nn.Module):
           trans_stats.add_enc_loss(t2r_kl.clone().item())
           r2t_kl = r2t_kl.div(float(normalization))
           repair_stats.add_enc_loss(r2t_kl.clone().item())
-          print("trl:", t2r_kl)
-          print("rtl:", r2t_kl)
           final_loss = final_loss + (t2r_kl + r2t_kl) / 2
         
         # use auto-mixed precision
