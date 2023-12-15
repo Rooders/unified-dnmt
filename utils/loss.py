@@ -42,7 +42,7 @@ def build_loss_compute(model, tgt_vocab, src_vocab, opt, train=True):
   # passed to the NMTLossCompute. At the moment, the only supported
   # loss function of this kind is the sparsemax loss.
   loss_gen = model.generator
-  compute = NMTLossCompute(criterion, loss_gen, opt.base_b, opt.add_s, opt.adaptive_training, opt.cross_task_reg)
+  compute = NMTLossCompute(criterion, loss_gen, opt.base_b, opt.add_s, opt.cross_task_reg)
   
   compute.to(device)
 
@@ -68,13 +68,12 @@ class LossComputeBase(nn.Module):
         normalzation (str): normalize by "sents" or "tokens"
     """
 
-    def __init__(self, criterion, generator, base_b, add_s, adaptive_training=False, cross_task_reg=False):
+    def __init__(self, criterion, generator, base_b, add_s, cross_task_reg=False):
         super(LossComputeBase, self).__init__()
         self.criterion = criterion
         self.generator = generator
         self.base_b = base_b
         self.add_s = add_s
-        self.adaptive_training = adaptive_training
         self.cross_task_reg = cross_task_reg
 
     @property
